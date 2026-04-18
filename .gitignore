@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Models (large binary files)
+src/soma_v2/models/*.joblib
+
+# ChromaDB local storage
+chroma_data/
+.chroma/
+
+# Experiment outputs (regenerable)
+experiments/results/*.csv
+experiments/results/*.json
+
+# Benchmark logs
+bench_out.txt
+bench_real_out.txt
+
+# Scratch outputs (keep scripts, ignore generated plots/data)
+scratch/*.png
+scratch/*.json
+
+# Paper build artifacts (keep source .tex and committed figures)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.bbl
+paper/*.blg
+paper/*.toc
+
+# Zip archives (regenerable)
+*.zip
