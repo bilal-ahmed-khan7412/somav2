@@ -160,13 +160,13 @@ class V2Kernel:
 
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        # Feed outcome back to classifier for online retraining
-        # If we forced a depth, we don't necessarily want to treat it as 'truth' 
-        # unless it was successful.
-        self.classifier.record_outcome(
-            agent_role, confidence, urgency, contested, reroute_attempts, depth,
-            event_text=event,
-        )
+        # Feed outcome back to classifier for online retraining.
+        # Skip if depth was forced — synthetic labels would corrupt the classifier.
+        if not forced_depth:
+            self.classifier.record_outcome(
+                agent_role, confidence, urgency, contested, reroute_attempts, depth,
+                event_text=event,
+            )
 
         record = {
             "event":       event[:80],

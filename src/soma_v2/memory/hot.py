@@ -38,6 +38,10 @@ class HotMemory:
         self.default_ttl = default_ttl
         # agent_id -> OrderedDict[key -> _Entry]  (insertion-order = LRU order)
         self._store: Dict[str, OrderedDict] = {}
+        # efficiency counters
+        self._hits:      int = 0
+        self._misses:    int = 0
+        self._evictions: int = 0
 
     # ── write ─────────────────────────────────────────────────────────────────
 
@@ -56,18 +60,22 @@ class HotMemory:
         ns[key] = _Entry(value=value, expires_at=expires_at)
         if len(ns) > self.capacity:
             ns.popitem(last=False)  # evict LRU
+            self._evictions += 1
 
     # ── read ──────────────────────────────────────────────────────────────────
 
     def get(self, agent_id: str, key: str) -> Optional[Any]:
         ns    = self._store.get(agent_id)
         if ns is None or key not in ns:
+            self._misses += 1
             return None
         entry = ns[key]
         if entry.expires_at and time.monotonic() > entry.expires_at:
             del ns[key]
+            self._misses += 1
             return None
         ns.move_to_end(key)
+        self._hits += 1
         return entry.value
 
     def get_all(self, agent_id: str) -> Dict[str, Any]:
@@ -95,10 +103,15 @@ class HotMemory:
 
     @property
     def stats(self) -> Dict[str, Any]:
+        total = self._hits + self._misses
         return {
             "namespaces": len(self._store),
             "total_keys": sum(len(ns) for ns in self._store.values()),
             "capacity":   self.capacity,
+            "hits":       self._hits,
+            "misses":     self._misses,
+            "evictions":  self._evictions,
+            "hit_rate":   f"{self._hits/total*100:.1f}%" if total else "n/a",
         }
 
     def _ns(self, agent_id: str) -> OrderedDict:
