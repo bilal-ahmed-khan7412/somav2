@@ -183,8 +183,14 @@ async def _llm_plan(event: str, role: str, urgency: str, llm_callback, memory=No
     prompt = _PLAN_PROMPT.format(event=event[:300], role=role, urgency=urgency, memory=mem_text)
     try:
         raw = await llm_callback("deliberative_plan", prompt)
-        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-        data  = json.loads(raw)
+        # ── multi-strategy JSON extraction ───────────────────────────────────
+        # Strategy 1: strip markdown fences and try directly
+        cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        # Strategy 2: extract first {...} block found anywhere in the response
+        brace_match = re.search(r"\{[\s\S]*\}", cleaned)
+        if brace_match:
+            cleaned = brace_match.group(0)
+        data  = json.loads(cleaned)
         graph = _steps_to_graph(data["steps"])
         graph.topological_waves()
         logger.info(f"DeliberativeAgent: LLM plan accepted ({len(graph)} steps)")

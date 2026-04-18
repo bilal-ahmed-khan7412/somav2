@@ -101,7 +101,7 @@ async def _mock_llm(prompt: str, label: str, counter: CallCounter) -> str:
     return "Task handled successfully."
 
 
-async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dict[str, Any]:
+async def run_autogen(workload: List[Dict], use_ollama: bool, model: str, semaphore: int = 2) -> Dict[str, Any]:
     """
     Real AutoGen RoundRobinGroupChat:
       - Complex: planner + executor agents, max 4 messages (2 per agent)
@@ -136,7 +136,7 @@ async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dic
     else:
         _make_client = None
 
-    sem = asyncio.Semaphore(NUM_SLOTS)
+    sem = asyncio.Semaphore(semaphore)  # rate-limit Ollama
 
     async def handle(task: Dict) -> None:
         async with sem:
@@ -180,9 +180,17 @@ async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dic
                 await team.run(task=task["text"])
 
     t0 = time.perf_counter()
-    await asyncio.gather(*[handle(t) for t in workload])
+    if use_ollama:
+        # Strictly sequential when using real Ollama — prevents llama runner OOM crashes
+        for t in workload:
+            try:
+                await handle(t)
+            except Exception as exc:
+                print(f"        [AutoGen] task failed: {exc!s:.80}")
+    else:
+        await asyncio.gather(*[handle(t) for t in workload])
     return {
-        "latency": time.perf_counter() - t0, 
+        "latency": time.perf_counter() - t0,
         "calls": counter.calls,
         "input_tokens": counter.input_tokens,
         "output_tokens": counter.output_tokens,
@@ -191,10 +199,10 @@ async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dic
 
 #  LangGraph real benchmark 
 
-async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> Dict[str, Any]:
+async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str, semaphore: int = 2) -> Dict[str, Any]:
     """
     Real LangGraph StateGraph:
-      classify  (plan)  execute
+      classify → (plan) → execute
       - Simple:  classify only (rule exit after)
       - Medium:  classify + plan
       - Complex: classify + plan + execute
@@ -207,7 +215,7 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
     else:
         llm = None
 
-    sem = asyncio.Semaphore(NUM_SLOTS)
+    sem = asyncio.Semaphore(semaphore)  # rate-limit Ollama
 
     async def handle(task: Dict) -> None:
         async with sem:
@@ -484,7 +492,9 @@ async def main() -> None:
     parser.add_argument("--skip-autogen",    action="store_true")
     parser.add_argument("--skip-langgraph",  action="store_true")
     parser.add_argument("--skip-cold",       action="store_true",
-                        help="Skip cold-start SOMA run (saves ~15 min on Ollama)")
+                        help="Skip cold-start SOMA run (saves time on Ollama)")
+    parser.add_argument("--semaphore",       type=int, default=2,
+                        help="Max concurrent LLM calls to Ollama (default 2, safe for local)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
@@ -499,17 +509,17 @@ async def main() -> None:
 
     if not args.skip_autogen:
         print("  [1/4] AutoGen (real framework)...")
-        all_results["AutoGen"] = await run_autogen(workload, args.use_ollama, args.model)
+        all_results["AutoGen"] = await run_autogen(workload, args.use_ollama, args.model, semaphore=args.semaphore)
         print(f"        done  {all_results['AutoGen']['calls']} LLM calls, {all_results['AutoGen']['latency']:.1f}s")
 
     if not args.skip_langgraph:
         print("  [2/4] LangGraph (real framework)...")
-        all_results["LangGraph"] = await run_langgraph(workload, args.use_ollama, args.model)
+        all_results["LangGraph"] = await run_langgraph(workload, args.use_ollama, args.model, semaphore=args.semaphore)
         print(f"        done  {all_results['LangGraph']['calls']} LLM calls, {all_results['LangGraph']['latency']:.1f}s")
 
     if not args.skip_cold:
         print("  [3/4] SOMA V2  cold start (no warm-up)...")
-        all_results["SOMA V2 (cold)"] = await run_soma(workload, args.use_ollama, args.model, warm_cache=False)
+        all_results["SOMA V2 (cold)"] = await run_soma(workload, args.use_ollama, args.model, warm_cache=False, semaphore=args.semaphore)
         r = all_results["SOMA V2 (cold)"]
         print(f"        done  {r['calls']} LLM calls, {r['latency']:.1f}s, cache hits={r['cache_hits']}")
         
@@ -539,7 +549,7 @@ async def main() -> None:
             print("        Plot saved: paper/cold_start_curve.png")
 
     print("  [4/4] SOMA V2  warm cache (after warm-up)...")
-    all_results["SOMA V2 (warm)"] = await run_soma(workload, args.use_ollama, args.model, warm_cache=True)
+    all_results["SOMA V2 (warm)"] = await run_soma(workload, args.use_ollama, args.model, warm_cache=True, semaphore=args.semaphore)
     r = all_results["SOMA V2 (warm)"]
     print(f"        done  {r['calls']} LLM calls, {r['latency']:.1f}s, cache hits={r['cache_hits']}")
 
