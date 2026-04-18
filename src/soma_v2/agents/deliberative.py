@@ -229,6 +229,14 @@ class DeliberativeAgent:
                 cached_match = True
                 cache_level  = "L2-cold"
 
+        # ── log hit/miss (Priority 4) ─────────────────────────────────────────
+        self._cache_log.append({
+            "task_num": len(self._cache_log) + 1,
+            "hit": cached_match,
+            "level": cache_level,
+            "event": event[:50]
+        })
+
         # ── L3: LLM plan generation ───────────────────────────────────────────
         if not graph:
             if self.llm_callback:

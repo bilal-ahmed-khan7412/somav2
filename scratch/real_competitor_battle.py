@@ -1,17 +1,17 @@
 """
-SOMA V2 vs AutoGen / LangGraph — Real Framework Benchmark
+SOMA V2 vs AutoGen / LangGraph  Real Framework Benchmark
 ==========================================================
 All three systems use the same Ollama model (qwen2.5:3b by default).
-No proxies, no arithmetic stand-ins — every LLM call is a real HTTP request.
+No proxies, no arithmetic stand-ins  every LLM call is a real HTTP request.
 
 AutoGen: RoundRobinGroupChat with a planner + executor agent.
   Each complex task gets a 2-agent conversation (planner writes steps, executor
   confirms each step). Medium = 1 agent, 1 turn. Simple = rule response (no LLM).
 
-LangGraph: StateGraph with classify → plan → execute nodes.
+LangGraph: StateGraph with classify  plan  execute nodes.
   Complex: classify + plan + execute (3 LLM calls).
   Medium:  classify + plan (2 LLM calls).
-  Simple:  classify only (1 LLM call) — rule short-circuit after.
+  Simple:  classify only (1 LLM call)  rule short-circuit after.
 
 SOMA V2: heterogeneous dispatch + L1/L2 semantic cache.
   Reactive (simple) = 0 LLM calls.
@@ -64,19 +64,23 @@ def generate_workload() -> List[Dict]:
     return workload
 
 
-# ── shared LLM call counter ───────────────────────────────────────────────────
+#  shared LLM call counter 
 
 class CallCounter:
     def __init__(self):
         self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
         self._lock = asyncio.Lock()
 
-    async def increment(self):
+    async def increment(self, input_tokens: int = 0, output_tokens: int = 0):
         async with self._lock:
             self.calls += 1
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
 
 
-# ── mock LLM (no Ollama) ──────────────────────────────────────────────────────
+#  mock LLM (no Ollama) 
 
 async def _mock_llm(prompt: str, label: str, counter: CallCounter) -> str:
     await counter.increment()
@@ -90,8 +94,6 @@ async def _mock_llm(prompt: str, label: str, counter: CallCounter) -> str:
     return "Task handled successfully."
 
 
-# ── AutoGen real benchmark ────────────────────────────────────────────────────
-
 async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dict[str, Any]:
     """
     Real AutoGen RoundRobinGroupChat:
@@ -103,8 +105,21 @@ async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dic
 
     if use_ollama:
         from autogen_ext.models.openai import OpenAIChatCompletionClient
+        class TokenCountingClient(OpenAIChatCompletionClient):
+            async def create(self, *args, **kwargs):
+                response = await super().create(*args, **kwargs)
+                prompt_tokens = 0
+                completion_tokens = 0
+                if hasattr(response, 'usage') and response.usage:
+                    prompt_tokens = response.usage.prompt_tokens
+                    completion_tokens = response.usage.completion_tokens
+                else:
+                    completion_tokens = len(getattr(response, 'content', '')) // 4
+                await counter.increment(prompt_tokens, completion_tokens)
+                return response
+
         def _make_client():
-            return OpenAIChatCompletionClient(
+            return TokenCountingClient(
                 model=model,
                 base_url=OLLAMA_BASE,
                 api_key="ollama",
@@ -119,18 +134,18 @@ async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dic
     async def handle(task: Dict) -> None:
         async with sem:
             if task["depth"] == "simple":
-                return  # rule-based, no LLM
+                return 
 
             if not use_ollama:
                 n_calls = 4 if task["depth"] == "complex" else 1
                 for _ in range(n_calls):
+                    await counter.increment(150, 100) # Mock tokens
                     await _mock_llm(task["text"], task["depth"], counter)
                 return
 
             from autogen_agentchat.agents import AssistantAgent
             from autogen_agentchat.conditions import MaxMessageTermination
             from autogen_agentchat.teams import RoundRobinGroupChat
-            from autogen_agentchat.messages import TextMessage
 
             if task["depth"] == "complex":
                 planner  = AssistantAgent(
@@ -148,33 +163,31 @@ async def run_autogen(workload: List[Dict], use_ollama: bool, model: str) -> Dic
                     termination_condition=MaxMessageTermination(4),
                 )
                 await team.run(task=task["text"])
-                # Count actual messages sent (each agent turn = 1 LLM call)
-                async with counter._lock:
-                    counter.calls += 2  # planner + executor, 1 turn each minimum
             else:
                 agent = AssistantAgent(
                     "router",
                     model_client=_make_client(),
                     system_message="Route this task briefly. One sentence.",
                 )
-                from autogen_agentchat.conditions import MaxMessageTermination
-                from autogen_agentchat.teams import RoundRobinGroupChat
                 team = RoundRobinGroupChat([agent], termination_condition=MaxMessageTermination(1))
                 await team.run(task=task["text"])
-                async with counter._lock:
-                    counter.calls += 1
 
     t0 = time.perf_counter()
     await asyncio.gather(*[handle(t) for t in workload])
-    return {"latency": time.perf_counter() - t0, "calls": counter.calls}
+    return {
+        "latency": time.perf_counter() - t0, 
+        "calls": counter.calls,
+        "input_tokens": counter.input_tokens,
+        "output_tokens": counter.output_tokens,
+    }
 
 
-# ── LangGraph real benchmark ──────────────────────────────────────────────────
+#  LangGraph real benchmark 
 
 async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> Dict[str, Any]:
     """
     Real LangGraph StateGraph:
-      classify → (plan) → execute
+      classify  (plan)  execute
       - Simple:  classify only (rule exit after)
       - Medium:  classify + plan
       - Complex: classify + plan + execute
@@ -199,7 +212,7 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
                     await _mock_llm(task["text"], depth, counter)
                 return
 
-            # Real LangGraph graph — build per-task (stateless, thread-safe)
+            # Real LangGraph graph  build per-task (stateless, thread-safe)
             from langgraph.graph import StateGraph, END
             from langchain_core.messages import HumanMessage
 
@@ -210,24 +223,27 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
                 result: str
 
             async def classify_node(state: State) -> State:
-                await counter.increment()
                 msg = await llm.ainvoke([HumanMessage(
                     content=f"Classify this task as simple/medium/complex in one word: {state['task']}"
                 )])
+                usage = getattr(msg, "usage_metadata", {})
+                await counter.increment(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
                 return {**state, "depth": msg.content.strip().split()[0].lower()}
 
             async def plan_node(state: State) -> State:
-                await counter.increment()
                 msg = await llm.ainvoke([HumanMessage(
                     content=f"List 3 steps to solve: {state['task']}"
                 )])
+                usage = getattr(msg, "usage_metadata", {})
+                await counter.increment(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
                 return {**state, "plan": msg.content}
 
             async def execute_node(state: State) -> State:
-                await counter.increment()
                 msg = await llm.ainvoke([HumanMessage(
                     content=f"Execute this plan and confirm success:\n{state['plan']}"
                 )])
+                usage = getattr(msg, "usage_metadata", {})
+                await counter.increment(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
                 return {**state, "result": msg.content}
 
             def route(state) -> str:
@@ -253,37 +269,37 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
 
     t0 = time.perf_counter()
     await asyncio.gather(*[handle(t) for t in workload])
-    return {"latency": time.perf_counter() - t0, "calls": counter.calls}
+    return {
+        "latency": time.perf_counter() - t0, 
+        "calls": counter.calls,
+        "input_tokens": counter.input_tokens,
+        "output_tokens": counter.output_tokens,
+    }
 
 
-# ── SOMA V2 ───────────────────────────────────────────────────────────────────
+#  SOMA V2 
 
-async def _soma_llm_driver(use_ollama: bool, model: str):
-    """Returns (driver_callable, call_stats_dict_ref)."""
-    calls      = [0]
+async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cache: bool = True, semaphore: int = 2) -> Dict[str, Any]:
+    counter = CallCounter()
     call_types: List[str] = []
 
     if use_ollama:
         import aiohttp
-
         async def driver(label: str, prompt: str) -> str:
-            calls[0] += 1
             call_types.append(label)
             async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                }
+                payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
                 async with session.post(f"{OLLAMA_BASE}/chat/completions", json=payload) as resp:
                     data = await resp.json()
+                    usage = data.get("usage", {})
+                    await counter.increment(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
                     return data["choices"][0]["message"]["content"]
     else:
         async def driver(label: str, prompt: str) -> str:
-            calls[0] += 1
             call_types.append(label)
-            await asyncio.sleep(0.20)
-            if label in ("deliberative_plan", "planning"):
+            await counter.increment(len(prompt) // 4, 100)
+            await asyncio.sleep(0.01)
+            if "plan" in label or "deliberative_plan" in label:
                 return json.dumps({"steps": [
                     {"id": "s1", "description": "Assess situation.",   "deps": [],      "alternative": None},
                     {"id": "s2", "description": "Identify options.",   "deps": ["s1"],  "alternative": None},
@@ -291,13 +307,8 @@ async def _soma_llm_driver(use_ollama: bool, model: str):
                 ]})
             return "Task handled successfully."
 
-    return driver, calls, call_types
-
-
-async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cache: bool = True) -> Dict[str, Any]:
-    driver, calls, call_types = await _soma_llm_driver(use_ollama, model)
     mem      = HierarchicalMemory(cold_enabled=True, cold_persist=None)
-    director = AgentDirector(llm_callback=driver, memory=mem)
+    director = AgentDirector(llm_callback=driver, memory=mem, llm_max_concurrent=semaphore)
     for i in range(NUM_SLOTS):
         director.add_slot(f"soma_{i}", role="SUPERVISOR" if i == 0 else "PEER")
     await director.start()
@@ -312,7 +323,11 @@ async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cach
                 if k not in seen:
                     seen.add(k)
                     await director.assign(t["text"], urgency=t["urgency"], forced_depth=t["depth"])
-        calls[0] = 0
+        # Reset counters after warm-up
+        async with counter._lock:
+            counter.calls = 0
+            counter.input_tokens = 0
+            counter.output_tokens = 0
         call_types.clear()
 
     t0      = time.perf_counter()
@@ -335,18 +350,54 @@ async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cach
         d = r.get("result", {}).get("depth", "?")
         depth_dist[d] = depth_dist.get(d, 0) + 1
 
+    #  classifier accuracy evaluation (Priority 2) 
+    # We use the classifier from the first slot to evaluate all tasks in workload
+    clf = list(director._slots.values())[0].kernel.classifier
+    correct = 0
+    y_true = []
+    y_pred = []
+    for t in workload:
+        pred, prob = clf.predict("PEER", 0.75, t["urgency"], False, 0, event_text=t["text"])
+        y_true.append(t["depth"])
+        y_pred.append(pred)
+        if pred == t["depth"]:
+            correct += 1
+    
+    accuracy = correct / len(workload) if workload else 0
+    
+    # Simple per-class precision (mocking full sklearn report for now)
+    classes = ["simple", "medium", "complex"]
+    class_stats = {}
+    for c in classes:
+        tp = sum(1 for i in range(len(y_true)) if y_true[i] == c and y_pred[i] == c)
+        fp = sum(1 for i in range(len(y_true)) if y_true[i] != c and y_pred[i] == c)
+        fn = sum(1 for i in range(len(y_true)) if y_true[i] == c and y_pred[i] != c)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0
+        class_stats[c] = {"precision": round(precision, 2), "recall": round(recall, 2)}
+
+    #  cache curve extraction (Priority 4) 
+    # Extract cache log from the deliberative agent (assume all slots share one if logic allows, 
+    # but here we just take the first one's agent)
+    cache_log = list(director._slots.values())[0].kernel.deliberative._cache_log
+
     from collections import Counter
     return {
         "latency":      latency,
-        "calls":        calls[0],
+        "calls":        counter.calls,
+        "input_tokens": counter.input_tokens,
+        "output_tokens": counter.output_tokens,
         "call_types":   dict(Counter(call_types)),
         "cache_hits":   cache_hits,
         "cache_levels": cache_levels,
         "depth_dist":   depth_dist,
+        "classifier_accuracy": round(accuracy, 3),
+        "classifier_stats": class_stats,
+        "cache_log":    cache_log,
     }
 
 
-# ── report ────────────────────────────────────────────────────────────────────
+#  report 
 
 def print_report(results: Dict[str, Any], workload: List[Dict], mode: str) -> None:
     soma_warm = results.get("SOMA V2 (warm)") or results.get("SOMA V2")
@@ -357,7 +408,7 @@ def print_report(results: Dict[str, Any], workload: List[Dict], mode: str) -> No
     complex_n = sum(1 for t in workload if t["depth"] == "complex")
 
     print("\n" + "=" * 82)
-    print("  SOMA V2 — REAL FRAMEWORK BENCHMARK (cold-start vs warm-cache)")
+    print("  SOMA V2  REAL FRAMEWORK BENCHMARK (cold-start vs warm-cache)")
     print(f"  Mode: {mode}  |  Tasks: {n}  |  Slots: {NUM_SLOTS}  |  Workload: 60% complex")
     print("=" * 82)
 
@@ -376,10 +427,18 @@ def print_report(results: Dict[str, Any], workload: List[Dict], mode: str) -> No
 
     print(row("Wall time (s)",      lambda d: f"{d['latency']:.1f}"))
     print(row("LLM calls total",    lambda d: str(d['calls'])))
+    print(row("Input tokens",       lambda d: str(d.get('input_tokens', 'N/A'))))
+    print(row("Output tokens",      lambda d: str(d.get('output_tokens', 'N/A'))))
+    print(row("Total tokens",       lambda d: str(d.get('input_tokens', 0) + d.get('output_tokens', 0)) if 'input_tokens' in d else 'N/A'))
     print(row("LLM calls / task",   lambda d: f"{d['calls']/n:.2f}"))
     print(row("Throughput (t/s)",   lambda d: f"{n/d['latency']:.3f}"))
     print(row("Cache hits",         lambda d: f"{d.get('cache_hits',0)}/{complex_n}"))
     print("-" * 82)
+
+    if soma_warm.get("classifier_accuracy"):
+        print(f"  Classifier Accuracy: {soma_warm['classifier_accuracy']*100:.1f}%")
+        print(f"  Classifier Stats:    {soma_warm['classifier_stats']}")
+        print("-" * 82)
 
     if auto:
         for label, s in [("SOMA cold", soma_cold), ("SOMA warm", soma_warm)]:
@@ -428,26 +487,52 @@ async def main() -> None:
     if not args.skip_autogen:
         print("  [1/4] AutoGen (real framework)...")
         all_results["AutoGen"] = await run_autogen(workload, args.use_ollama, args.model)
-        print(f"        done — {all_results['AutoGen']['calls']} LLM calls, {all_results['AutoGen']['latency']:.1f}s")
+        print(f"        done  {all_results['AutoGen']['calls']} LLM calls, {all_results['AutoGen']['latency']:.1f}s")
 
     if not args.skip_langgraph:
         print("  [2/4] LangGraph (real framework)...")
         all_results["LangGraph"] = await run_langgraph(workload, args.use_ollama, args.model)
-        print(f"        done — {all_results['LangGraph']['calls']} LLM calls, {all_results['LangGraph']['latency']:.1f}s")
+        print(f"        done  {all_results['LangGraph']['calls']} LLM calls, {all_results['LangGraph']['latency']:.1f}s")
 
     if not args.skip_cold:
-        print("  [3/4] SOMA V2 — cold start (no warm-up)...")
+        print("  [3/4] SOMA V2  cold start (no warm-up)...")
         all_results["SOMA V2 (cold)"] = await run_soma(workload, args.use_ollama, args.model, warm_cache=False)
         r = all_results["SOMA V2 (cold)"]
-        print(f"        done — {r['calls']} LLM calls, {r['latency']:.1f}s, cache hits={r['cache_hits']}")
+        print(f"        done  {r['calls']} LLM calls, {r['latency']:.1f}s, cache hits={r['cache_hits']}")
+        
+        # Priority 4: Generate cold-start curve plot
+        import matplotlib.pyplot as plt
+        log = r.get("cache_log", [])
+        if log:
+            task_nums = [l["task_num"] for l in log]
+            # Cumulative hits
+            hits = []
+            curr_hits = 0
+            for i, l in enumerate(log):
+                if l["hit"]:
+                    curr_hits += 1
+                hits.append(curr_hits / (i + 1))
+            
+            plt.figure(figsize=(10, 5))
+            plt.plot(task_nums, hits, marker='s', color='g', label="Cumulative Hit Rate")
+            plt.title("SOMA V2: Cold-Start Learning Curve (L1+L2 Cache)")
+            plt.xlabel("Deliberative Task Number")
+            plt.ylabel("Cumulative Hit Rate")
+            plt.ylim(0, 1.1)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            os.makedirs("paper", exist_ok=True)
+            plt.savefig("paper/cold_start_curve.png")
+            print("        Plot saved: paper/cold_start_curve.png")
 
-    print("  [4/4] SOMA V2 — warm cache (after warm-up)...")
+    print("  [4/4] SOMA V2  warm cache (after warm-up)...")
     all_results["SOMA V2 (warm)"] = await run_soma(workload, args.use_ollama, args.model, warm_cache=True)
     r = all_results["SOMA V2 (warm)"]
-    print(f"        done — {r['calls']} LLM calls, {r['latency']:.1f}s, cache hits={r['cache_hits']}")
+    print(f"        done  {r['calls']} LLM calls, {r['latency']:.1f}s, cache hits={r['cache_hits']}")
 
     print_report(all_results, workload, mode)
 
 
 if __name__ == "__main__":
+    import os
     asyncio.run(main())
