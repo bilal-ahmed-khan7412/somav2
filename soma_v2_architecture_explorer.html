@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SOMA V2 Interactive Architecture</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #050505;
+            --surface-color: rgba(22, 27, 34, 0.6);
+            --surface-border: rgba(255, 255, 255, 0.1);
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --accent-blue: #38bdf8;
+            --accent-purple: #8b5cf6;
+            --accent-teal: #2dd4bf;
+            --accent-orange: #fb923c;
+            --accent-green: #34d399;
+            --accent-red: #f87171;
+            --node-bg: #1e293b;
+        }
+
+        body {
+            margin: 0;
+            font-family: 'Outfit', sans-serif;
+            background: #0f172a;
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow-x: hidden;
+            padding-bottom: 50px;
+        }
+
+        /* Hero Section */
+        header { text-align: center; margin-top: 50px; margin-bottom: 30px; }
+        h1 { font-size: 3rem; font-weight: 800; margin: 0; background: linear-gradient(90deg, var(--accent-blue), var(--accent-teal)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        p.subtitle { color: var(--text-secondary); max-width: 600px; margin: 10px auto; font-size: 1.1rem; }
+
+        /* Flowchart Layout */
+        #architectureFlow {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 95%;
+            max-width: 1000px;
+            z-index: 10;
+        }
+
+        .flow-node {
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+
+        .flow-row-split {
+            display: flex;
+            justify-content: center;
+            align-items: stretch;
+            width: 100%;
+            gap: 20px;
+            transition: all 0.3s;
+        }
+        
+        .flow-row-split .flow-node {
+            flex: 1;
+        }
+
+        .flow-arrow {
+            padding: 20px 0;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            font-weight: 600;
+            opacity: 0.8;
+            letter-spacing: 1px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+            text-transform: uppercase;
+        }
+
+        .flow-arrow::before {
+            content: '↓';
+            font-size: 1.5rem;
+            color: var(--accent-blue);
+        }
+
+        .flow-arrow.horizontal {
+            flex-direction: row;
+            padding: 0 10px;
+            color: var(--text-secondary);
+            align-items: center;
+            white-space: nowrap;
+        }
+        
+        .flow-arrow.horizontal::before { 
+            content: '↔'; 
+            font-size: 1.5rem;
+            color: var(--accent-purple);
+        }
+
+        /* When expanded */
+        #architectureFlow.expanded-view .flow-arrow { display: none; }
+        #architectureFlow.expanded-view .flow-row-split { display: block; }
+        #architectureFlow.expanded-view .flow-node { display: none; }
+        #architectureFlow.expanded-view .flow-node.active-node { display: flex; width: 100%; }
+
+        /* Top Level Cards */
+        .card {
+            background: var(--surface-color);
+            border: 1px solid var(--surface-border);
+            border-radius: 16px;
+            padding: 25px;
+            cursor: pointer;
+            transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+            position: relative;
+            width: 100%;
+            max-width: 600px;
+        }
+
+        .card:hover { border-color: rgba(255, 255, 255, 0.2); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4); transform: translateY(-3px); }
+        .card h2 { margin: 0 0 5px 0; font-size: 1.5rem; display: flex; align-items: center; gap: 10px; }
+        .card.director h2 { color: var(--accent-blue); }
+        .card.kernel h2 { color: var(--accent-teal); }
+        .card.agent h2 { color: var(--accent-orange); }
+        .card.memory h2 { color: var(--accent-purple); }
+
+        /* Expanded State */
+        .card.expanded { max-width: 1000px; cursor: default; transform: none; background: #162032; border-color: var(--accent-blue); }
+        .card.expanded:hover { transform: none; box-shadow: none; }
+        .card.expanded p.summary { display: none; }
+        
+        /* Interactive DOM Architecture View */
+        .interactive-view {
+            display: none;
+            opacity: 0;
+            margin-top: 20px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            padding-top: 30px;
+        }
+        .card.expanded .interactive-view { display: block; animation: fadeIn 0.8s forwards; }
+
+        /* Close Button */
+        .close-btn { background: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.2); color: white; padding: 8px 16px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; cursor: pointer; transition: background 0.3s; margin-top: 20px; }
+        .close-btn:hover { background: rgba(255, 255, 255, 0.2); }
+
+        /* === DOM NODE ARCHITECTURE STYLES === */
+        .arch-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+            position: relative;
+            padding: 20px 0;
+        }
+
+        .arch-row {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            width: 100%;
+            position: relative;
+        }
+
+        .node {
+            background: var(--node-bg);
+            border: 2px solid rgba(255,255,255,0.15);
+            border-radius: 10px;
+            padding: 15px 25px;
+            min-width: 150px;
+            text-align: center;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            position: relative;
+            z-index: 2;
+        }
+
+        .node:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 20px rgba(255,255,255,0.1);
+            z-index: 10;
+        }
+
+        .node h3 { margin: 0 0 8px 0; font-size: 1.1rem; }
+        .node p { margin: 0; font-size: 0.85rem; color: var(--text-secondary); font-family: 'JetBrains Mono', monospace; }
+
+        /* Tooltip styles */
+        .node[data-tooltip]::before {
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: calc(100% + 15px);
+            left: 50%;
+            transform: translateX(-50%) translateY(10px);
+            background: rgba(15, 23, 42, 0.95);
+            color: #e2e8f0;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            width: max-content;
+            max-width: 250px;
+            text-align: center;
+            border: 1px solid var(--accent-blue);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            pointer-events: none;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 400;
+        }
+
+        /* Tooltip Arrow */
+        .node[data-tooltip]::after {
+            content: '';
+            position: absolute;
+            bottom: calc(100% + 7px);
+            left: 50%;
+            transform: translateX(-50%) translateY(10px);
+            border-width: 8px;
+            border-style: solid;
+            border-color: var(--accent-blue) transparent transparent transparent;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            pointer-events: none;
+        }
+
+        .node[data-tooltip]:hover::before,
+        .node[data-tooltip]:hover::after {
+            opacity: 1;
+            visibility: visible;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        /* Specific Node Colors */
+        .node.blue { border-color: var(--accent-blue); }
+        .node.blue:hover { box-shadow: 0 0 25px rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.1); }
+        .node.blue[data-tooltip]::before { border-color: var(--accent-blue); }
+        .node.blue[data-tooltip]::after { border-color: var(--accent-blue) transparent transparent transparent; }
+        
+        .node.teal { border-color: var(--accent-teal); }
+        .node.teal:hover { box-shadow: 0 0 25px rgba(45, 212, 191, 0.4); background: rgba(45, 212, 191, 0.1); }
+        .node.teal[data-tooltip]::before { border-color: var(--accent-teal); }
+        .node.teal[data-tooltip]::after { border-color: var(--accent-teal) transparent transparent transparent; }
+        
+        .node.orange { border-color: var(--accent-orange); }
+        .node.orange:hover { box-shadow: 0 0 25px rgba(251, 146, 60, 0.4); background: rgba(251, 146, 60, 0.1); }
+        .node.orange[data-tooltip]::before { border-color: var(--accent-orange); }
+        .node.orange[data-tooltip]::after { border-color: var(--accent-orange) transparent transparent transparent; }
+
+        .node.purple { border-color: var(--accent-purple); }
+        .node.purple:hover { box-shadow: 0 0 25px rgba(139, 92, 246, 0.4); background: rgba(139, 92, 246, 0.1); }
+        .node.purple[data-tooltip]::before { border-color: var(--accent-purple); }
+        .node.purple[data-tooltip]::after { border-color: var(--accent-purple) transparent transparent transparent; }
+
+        .node.green { border-color: var(--accent-green); }
+        .node.green:hover { box-shadow: 0 0 25px rgba(52, 211, 153, 0.4); background: rgba(52, 211, 153, 0.1); }
+        .node.green[data-tooltip]::before { border-color: var(--accent-green); }
+        .node.green[data-tooltip]::after { border-color: var(--accent-green) transparent transparent transparent; }
+
+        .node.red { border-color: var(--accent-red); }
+        .node.red:hover { box-shadow: 0 0 25px rgba(248, 113, 113, 0.4); background: rgba(248, 113, 113, 0.1); }
+        .node.red[data-tooltip]::before { border-color: var(--accent-red); }
+        .node.red[data-tooltip]::after { border-color: var(--accent-red) transparent transparent transparent; }
+
+        /* Bounding Boxes for Sub-systems */
+        .bounding-box {
+            border: 2px dashed rgba(255,255,255,0.2);
+            border-radius: 12px;
+            padding: 30px;
+            position: relative;
+            background: rgba(0,0,0,0.2);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            align-items: center;
+        }
+        .bounding-box::before {
+            content: attr(data-title);
+            position: absolute;
+            top: -12px;
+            left: 20px;
+            background: #162032;
+            padding: 0 10px;
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        /* Pure CSS Connecting Lines (Arrows) */
+        .arrow-down::after {
+            content: '↓';
+            position: absolute;
+            bottom: -22px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255,255,255,0.4);
+            font-size: 1.2rem;
+        }
+        .arrow-label {
+            position: absolute;
+            background: #0f172a;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            z-index: 3;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>SOMA V2 Reactive Architecture</h1>
+        <p class="subtitle">Fully interactive DOM-based visualization. Tap a sub-system to explore the live reactive node map.</p>
+    </header>
+
+    <div id="architectureFlow">
+        
+        <!-- Component 1: Agent Director -->
+        <div class="flow-node" id="node-director">
+            <div class="card director" onclick="expandCard(this)">
+                <h2>🏛️ 1. Agent Director</h2>
+                <p class="summary">The centralized management hub handling the A2A Message Bus, Blackboard, and Negotiation.</p>
+                
+                <div class="interactive-view">
+                    <div class="arch-container">
+                        <div class="node" data-tooltip="External event or system command requesting swarm action." style="border-color: #fff;">
+                            <h3>Incoming Task</h3>
+                            <p>Drone swarm coordination request</p>
+                            <div class="arrow-down"></div>
+                        </div>
+                        
+                        <div class="bounding-box" data-title="AgentDirector Module">
+                            <div class="node blue" data-tooltip="High-throughput publish-subscribe bus for inter-agent communication." style="width: 80%;">
+                                <h3>A2A Message Bus</h3>
+                                <p>Pub/Sub Event Routing</p>
+                            </div>
+                            <div class="arch-row">
+                                <div class="node teal" data-tooltip="Resolves agent conflicts by proposing mutual yields and resource priorities.">
+                                    <h3>Negotiation Broker</h3>
+                                    <p>- Detects Conflicts<br>- Proposes Yields</p>
+                                </div>
+                                <div class="node teal" data-tooltip="Shared atomic state storage for safe lock management and introspection.">
+                                    <h3>Resource Blackboard</h3>
+                                    <p>- Atomic Locks<br>- State Introspection</p>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="arrow-down" style="position:relative; margin-top:-20px; height:20px; width:100%;"></div>
+                        
+                        <div class="node purple" data-tooltip="Optimally distributes task payloads across the D1, D2, and D3 agent tiers.">
+                            <h3>Load Balancer & Dispatch</h3>
+                            <p>Distributes load across tiers</p>
+                        </div>
+                    </div>
+                    <button class="close-btn" onclick="closeCard(event, this.parentElement.parentElement)">Collapse View ✕</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="flow-arrow">Routes Tasks To</div>
+
+        <!-- Component 2: V2 Kernel -->
+        <div class="flow-node" id="node-kernel">
+            <div class="card kernel" onclick="expandCard(this)">
+                <h2>🧠 2. V2 Kernel & Depth Classifier</h2>
+                <p class="summary">Extracts features from raw inputs and utilizes an ML classifier to route tasks dynamically.</p>
+                
+                <div class="interactive-view">
+                    <div class="arch-container">
+                        <div class="node" data-tooltip="Raw input command passed directly into the SOMA kernel layer." style="border-color: #fff;">
+                            <h3>Task String</h3>
+                            <p>"Inspect bridge sector 7"</p>
+                            <div class="arrow-down"></div>
+                        </div>
+
+                        <div class="bounding-box" data-title="V2 Kernel">
+                            <div class="arch-row">
+                                <div class="node teal arrow-down" data-tooltip="Parses input syntax, identifying action verbs, entity counts, and required tools." style="position:relative;">
+                                    <h3>Feature Extraction</h3>
+                                    <p>Entity Count, Action Verbs</p>
+                                </div>
+                                <div class="arrow-label" style="top: 35%; left: 45%;">Feed Forward →</div>
+                                <div class="node blue" data-tooltip="Trained scikit-learn model predicting task complexity score from 0.0 to 1.0.">
+                                    <h3>ML Classifier</h3>
+                                    <p>scikit-learn Predictor</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="arch-row" style="margin-top: 20px;">
+                            <div class="node green" data-tooltip="Score < 0.3. Zero LLM calls. Executes fast, static programmatic rules.">
+                                <h3>Reactive (D1)</h3>
+                                <p>Score < 0.3 (0 LLM)</p>
+                            </div>
+                            <div class="node orange" data-tooltip="Score 0.3 - 0.7. Single LLM call. Delegates sub-tasks to other agents.">
+                                <h3>Routing (D2)</h3>
+                                <p>Score 0.3 - 0.7 (1 LLM)</p>
+                            </div>
+                            <div class="node red" data-tooltip="Score > 0.7. Full multi-step reasoning utilizing an advanced LLM Planner.">
+                                <h3>Deliberative (D3)</h3>
+                                <p>Score > 0.7 (Planner)</p>
+                            </div>
+                        </div>
+                    </div>
+                    <button class="close-btn" onclick="closeCard(event, this.parentElement.parentElement)">Collapse View ✕</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="flow-arrow">Dispatches via D1/D2/D3</div>
+
+        <div class="flow-row-split">
+            <!-- Component 3: Tiered Agents (D3) -->
+            <div class="flow-node" id="node-agent">
+                <div class="card agent" onclick="expandCard(this)">
+                    <h2>⚡ 3. Tiered Agent Slots (D3)</h2>
+                    <p class="summary">The execution layer featuring reactive routing and semantic deliberative planning.</p>
+                    
+                    <div class="interactive-view">
+                        <div class="arch-container">
+                            <div class="node" data-tooltip="A high-complexity task requiring deliberative step-by-step reasoning." style="border-color: #fff;">
+                                <h3>Complex Task Dispatched</h3>
+                                <div class="arrow-down"></div>
+                            </div>
+
+                            <div class="node purple" data-tooltip="Queries the Vector DB for identical, previously solved task plans to save compute.">
+                                <h3>Semantic Cache Check (L2)</h3>
+                                <p>Vector similarity > threshold?</p>
+                            </div>
+
+                            <div class="arch-row" style="margin-top: 10px;">
+                                <!-- Hit Path -->
+                                <div class="arch-container" style="padding:0;">
+                                    <div class="arrow-label" style="position:relative; margin-bottom: 10px; border-color: var(--accent-green);">Cache Hit (Zero-Shot) ↓</div>
+                                    <div class="node green" data-tooltip="Bypasses the LLM entirely, executing the cached plan for a >16,000x latency drop.">
+                                        <h3>Immediate Execution</h3>
+                                        <p>>16,000x Speedup</p>
+                                    </div>
+                                </div>
+
+                                <!-- Miss Path -->
+                                <div class="arch-container" style="padding:0;">
+                                    <div class="arrow-label" style="position:relative; margin-bottom: 10px; border-color: var(--accent-red);">Cache Miss ↓</div>
+                                    <div class="node blue" data-tooltip="Leverages a large language model to reason through constraints and formulate steps.">
+                                        <h3>LLM Planner</h3>
+                                        <p>Multi-step Reasoning</p>
+                                        <div class="arrow-down"></div>
+                                    </div>
+                                    <div class="node orange" style="margin-top:20px;" data-tooltip="Executes the generated Directed Acyclic Graph plan via external actuators.">
+                                        <h3>DAG Plan Execution</h3>
+                                        <p>Actuator Bridge</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <button class="close-btn" onclick="closeCard(event, this.parentElement.parentElement)">Collapse View ✕</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flow-arrow horizontal">Reads/Writes</div>
+
+            <!-- Component 4: Hierarchical Memory -->
+            <div class="flow-node" id="node-memory">
+                <div class="card memory" onclick="expandCard(this)">
+                    <h2>💾 4. Hierarchical Memory</h2>
+                    <p class="summary">Dual-tier memory system for rapid access (L1) and deep semantic recall (L2 ChromaDB).</p>
+                    
+                    <div class="interactive-view">
+                        <div class="arch-container">
+                            
+                            <div class="arch-row">
+                                <div class="node red" data-tooltip="Ultra-fast, in-memory dictionary holding active state locks and immediate context.">
+                                    <h3>L1 HotMemory</h3>
+                                    <p>- LRU Cache<br>- In-Memory Dict<br>- Latency: <0.1ms</p>
+                                </div>
+                                
+                                <div class="arrow-label" style="position:relative; align-self:center;">Evict (TTL) →</div>
+
+                                <div class="node blue" data-tooltip="Persistent vector database using Sentence-Transformers for semantic similarity search.">
+                                    <h3>L2 ColdMemory</h3>
+                                    <p>- ChromaDB Vector Store<br>- Sentence-Transformers<br>- Semantic Search</p>
+                                </div>
+                            </div>
+
+                            <div class="arrow-down" style="position:relative; height:20px;"></div>
+
+                            <div class="node purple" style="margin-top:20px;" data-tooltip="Long-term archival logs for system auditing, debugging, and offline ML training.">
+                                <h3>Persistent Disk Storage</h3>
+                                <p>archive_*.txt</p>
+                            </div>
+
+                        </div>
+                        <button class="close-btn" onclick="closeCard(event, this.parentElement.parentElement)">Collapse View ✕</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        function expandCard(card) {
+            if (card.classList.contains('expanded')) return;
+            
+            const flowContainer = document.getElementById('architectureFlow');
+            flowContainer.classList.add('expanded-view');
+            
+            const allCards = document.querySelectorAll('.card');
+            allCards.forEach(c => {
+                c.classList.remove('expanded');
+            });
+
+            const allNodes = document.querySelectorAll('.flow-node');
+            allNodes.forEach(n => n.classList.remove('active-node'));
+
+            card.parentElement.classList.add('active-node');
+            card.classList.add('expanded');
+            
+            setTimeout(() => {
+                card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }, 50);
+        }
+
+        function closeCard(event, card) {
+            event.stopPropagation();
+            card.classList.remove('expanded');
+            card.parentElement.classList.remove('active-node');
+            
+            const flowContainer = document.getElementById('architectureFlow');
+            flowContainer.classList.remove('expanded-view');
+            
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+    </script>
+</body>
+</html>
