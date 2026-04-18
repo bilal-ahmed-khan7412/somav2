@@ -230,11 +230,13 @@ class DeliberativeAgent:
                 cache_level  = "L2-cold"
 
         # ── log hit/miss (Priority 4) ─────────────────────────────────────────
+        import time
         self._cache_log.append({
             "task_num": len(self._cache_log) + 1,
             "hit": cached_match,
             "level": cache_level,
-            "event": event[:50]
+            "event": event[:50],
+            "timestamp": time.time()
         })
 
         # ── L3: LLM plan generation ───────────────────────────────────────────

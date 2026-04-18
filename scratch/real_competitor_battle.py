@@ -298,7 +298,7 @@ async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cach
         async def driver(label: str, prompt: str) -> str:
             call_types.append(label)
             await counter.increment(len(prompt) // 4, 100)
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
             if "plan" in label or "deliberative_plan" in label:
                 return json.dumps({"steps": [
                     {"id": "s1", "description": "Assess situation.",   "deps": [],      "alternative": None},
@@ -331,10 +331,22 @@ async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cach
         call_types.clear()
 
     t0      = time.perf_counter()
-    results = await asyncio.gather(*[
-        director.assign(t["text"], urgency=t["urgency"], forced_depth=t["depth"])
-        for t in workload
-    ])
+    # For cold-start curve, we run a bit more sequentially to show learning
+    if not warm_cache:
+        # Run in small batches to allow cache to populate for the curve
+        results = []
+        for i in range(0, len(workload), 2):
+            batch = workload[i:i+2]
+            res = await asyncio.gather(*[
+                director.assign(t["text"], urgency=t["urgency"], forced_depth=t["depth"])
+                for t in batch
+            ])
+            results.extend(res)
+    else:
+        results = await asyncio.gather(*[
+            director.assign(t["text"], urgency=t["urgency"], forced_depth=t["depth"])
+            for t in workload
+        ])
     latency = time.perf_counter() - t0
     await director.stop()
 
@@ -377,9 +389,11 @@ async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cach
         class_stats[c] = {"precision": round(precision, 2), "recall": round(recall, 2)}
 
     #  cache curve extraction (Priority 4) 
-    # Extract cache log from the deliberative agent (assume all slots share one if logic allows, 
-    # but here we just take the first one's agent)
-    cache_log = list(director._slots.values())[0].kernel.deliberative._cache_log
+    # Aggregate logs from ALL slots and sort by timestamp
+    full_log = []
+    for slot in director._slots.values():
+        full_log.extend(slot.kernel.deliberative._cache_log)
+    full_log.sort(key=lambda x: x["timestamp"])
 
     from collections import Counter
     return {
@@ -393,7 +407,7 @@ async def run_soma(workload: List[Dict], use_ollama: bool, model: str, warm_cach
         "depth_dist":   depth_dist,
         "classifier_accuracy": round(accuracy, 3),
         "classifier_stats": class_stats,
-        "cache_log":    cache_log,
+        "cache_log":    full_log,
     }
 
 
