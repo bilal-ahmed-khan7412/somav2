@@ -30,7 +30,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
-from .a2a import A2ABus, A2AMessage, MsgType
+from .a2a import A2ABus, A2AMessage, MsgType, ResourceBlackboard
+from .negotiation import NegotiationBroker
 from .kernel import V2Kernel
 from ..memory.hierarchical import HierarchicalMemory
 
@@ -149,7 +150,8 @@ class AgentSlot:
                 agent_type = outcome.get("result", {}).get("agent_type", "unknown") if success else "unknown"
                 decision   = outcome.get("result", {}).get("decision", {}) if success else {}
                 action     = decision.get("action", "unknown")
-                extra      = {"plan_json": decision.get("plan_json")} if "plan_json" in decision else None
+                meta       = decision.get("metadata", {})
+                extra      = {"plan_json": meta.get("plan_json")} if meta.get("plan_json") else None
                 self.memory.task_done(self.slot_id, agent_type, action, urgency, success, extra=extra)
 
         await self._bus.send(A2AMessage(
@@ -177,16 +179,19 @@ class AgentDirector:
     await director.stop()
     """
 
-    def __init__(self, llm_callback=None, memory: Optional[HierarchicalMemory] = None, **kernel_kwargs) -> None:
+    def __init__(self, llm_callback=None, memory: Optional[HierarchicalMemory] = None, actuator: Optional[Any] = None, **kernel_kwargs) -> None:
         self.llm_callback   = llm_callback
+        self.actuator       = actuator
         self._kernel_kwargs = kernel_kwargs
         self._memory        = memory or HierarchicalMemory()
-        self._bus:   A2ABus            = A2ABus()
+        self._bus:        A2ABus             = A2ABus()
+        self._blackboard: ResourceBlackboard = ResourceBlackboard(bus=self._bus)
+        self._negotiator: NegotiationBroker  = NegotiationBroker(blackboard=self._blackboard, bus=self._bus)
         self._slots: Dict[str, AgentSlot] = {}
         self._director_id = "director"
         self._dir_queue   = self._bus.register(self._director_id)
         self._stats: Dict[str, int]   = {"tasks_assigned": 0, "tasks_delegated": 0, "tasks_failed": 0}
-        self._rr_counter: int         = 0  # round-robin tiebreaker
+        self._rr_counter: int         = 0
 
     def add_slot(
         self,
@@ -194,7 +199,19 @@ class AgentDirector:
         role: str = "PEER",
         capacity: int = 4,
     ) -> "AgentDirector":
-        kernel = V2Kernel(llm_callback=self.llm_callback, memory=self._memory, **self._kernel_kwargs)
+        async def _delegate(sub_task: str, urgency: str = "medium") -> str:
+            """Route a plan sub-task back through Director A2A — one hop max."""
+            result = await self.assign(sub_task, urgency=urgency, _hop=MAX_DELEGATE_HOPS)
+            decision = result.get("result", {}).get("decision", {})
+            return decision.get("rationale", result.get("result", {}).get("depth", "delegated"))
+
+        kernel = V2Kernel(
+            llm_callback=self.llm_callback, memory=self._memory,
+            actuator=self.actuator, delegate_fn=_delegate,
+            blackboard=self._blackboard, agent_id=slot_id,
+            negotiation_broker=self._negotiator,
+            **self._kernel_kwargs,
+        )
         slot   = AgentSlot(slot_id=slot_id, role=role, capacity=capacity, kernel=kernel, memory=self._memory)
         slot.attach(self._bus)
         self._slots[slot_id] = slot
@@ -321,7 +338,10 @@ class AgentDirector:
     def stats(self) -> Dict[str, Any]:
         slot_loads = {sid: s.load for sid, s in self._slots.items()}
         return {**self._stats, "slot_loads": slot_loads,
-                "bus_messages": self._bus.message_count, "memory": self._memory.stats}
+                "bus_messages": self._bus.message_count,
+                "blackboard":  self._blackboard.stats,
+                "negotiation": self._negotiator.stats,
+                "memory":      self._memory.stats}
 
     @property
     def pool_size(self) -> int:

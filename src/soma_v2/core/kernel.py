@@ -88,11 +88,17 @@ class V2Kernel:
         llm_timeout_s: float = 30.0,
         llm_max_retries: int = 2,
         llm_max_concurrent: int = 2,
+        cold_threshold: float = 0.40,
+        actuator: Optional[Any] = None,
+        delegate_fn=None,
+        blackboard=None,
+        agent_id: str = "unknown",
+        negotiation_broker=None,
     ):
         self.llm_callback = llm_callback
         self.memory       = memory
+        self.actuator     = actuator
 
-        # Wrap callback with semaphore + timeout + retry
         _llm = _make_resilient_llm(llm_callback, timeout_s=llm_timeout_s, max_retries=llm_max_retries, max_concurrent=llm_max_concurrent)
 
         self.classifier = DepthClassifier(
@@ -103,7 +109,12 @@ class V2Kernel:
 
         self.reactive     = ReactiveAgent()
         self.routing      = RoutingAgent(llm_callback=_llm)
-        self.deliberative = DeliberativeAgent(llm_callback=_llm, memory=memory)
+        self.deliberative = DeliberativeAgent(
+            llm_callback=_llm, memory=memory, cold_threshold=cold_threshold,
+            actuator=actuator, delegate_fn=delegate_fn,
+            blackboard=blackboard, agent_id=agent_id,
+            negotiation_broker=negotiation_broker,
+        )
 
         self._dispatch_log: List[Dict[str, Any]] = []
 

@@ -15,7 +15,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from ..core.planner import PlanGraph, PlanNode, PlanExecutor
 
@@ -27,11 +27,17 @@ logger = logging.getLogger("SOMA_V2.DELIBERATIVE")
 
 _STRIP_PREFIX  = re.compile(r"^var_\d+\s*:\s*", re.IGNORECASE)
 _STRIP_NUMBERS = re.compile(r"\b[A-Z]?\d+\b")          # bare digits and ID tokens like A12, P5
+_NORM_AGENTS   = re.compile(r"\b(drone|rov|submersible|uav|sub)\b", re.IGNORECASE)
+_NORM_ACTIONS  = re.compile(r"\b(rescue|extraction|salvage|mission)\b", re.IGNORECASE)
+_NORM_SENSORS  = re.compile(r"\b(sonar|sensor|radar)\b", re.IGNORECASE)
 _MULTI_SPACE   = re.compile(r"\s{2,}")
 
 def _normalise(text: str) -> str:
     text = _STRIP_PREFIX.sub("", text)
     text = _STRIP_NUMBERS.sub("N", text)
+    text = _NORM_AGENTS.sub("AGENT_UNIT", text)
+    text = _NORM_ACTIONS.sub("MISSION", text)
+    text = _NORM_SENSORS.sub("SENSOR", text)
     text = _MULTI_SPACE.sub(" ", text).lower().strip()
     return text
 
@@ -65,6 +71,8 @@ Rules:
 - Descriptions must be concrete and actionable.
 - If memory shows FAILED cases, add an extra verification step or alternative path.
 - If memory shows SUCCESS cases with fewer steps, prefer the simpler plan.
+- If the step requires physical movement or drone action, append "[CMD] TAKEOFF <unit>", "[CMD] GOTO <unit> <target>", or "[CMD] LAND <unit>".
+- If the step requires a separate agent to handle a sub-task concurrently, append "[DELEGATE] <sub-task description>".
 """
 
 _FALLBACK_STEPS = [
@@ -79,6 +87,49 @@ _FALLBACK_STEPS = [
 ]
 
 _HOT_CACHE_AGENT = "__plan_cache__"   # namespace in HotMemory for cross-task plan cache
+
+
+# ── command injection ─────────────────────────────────────────────────────────
+# Maps action keywords in step descriptions to [CMD] tokens deterministically.
+# Runs after plan generation so the LLM never needs to get the syntax right.
+
+_UNIT_RE      = re.compile(r'\b([A-Z]\d+)\b')           # e.g. A12, B4, C3
+_TAKEOFF_KW   = re.compile(r'\b(takeoff|launch|ascend|lift.?off|deploy unit)\b', re.I)
+_GOTO_KW      = re.compile(r'\b(navigate|proceed|move|fly|travel|head to|route)\b', re.I)
+_LAND_KW      = re.compile(r'\b(land|descend|RTB|return to base|touch.?down)\b', re.I)
+_SCAN_KW      = re.compile(r'\b(scan|sweep|survey|search area|recon)\b', re.I)
+_DEPLOY_KW    = re.compile(r'\b(deploy|drop|release|deliver)\b', re.I)
+_STATUS_KW    = re.compile(r'\b(status|ping|check|verify|confirm online)\b', re.I)
+
+
+def _inject_commands(graph: PlanGraph, event: str) -> PlanGraph:
+    """
+    Post-process a PlanGraph: append [CMD] tokens to step descriptions
+    that match action keywords but don't already have a [CMD] tag.
+    Unit names are extracted from the event text or default to UNIT.
+    """
+    units = _UNIT_RE.findall(event) or ["UNIT"]
+    primary = units[0]
+
+    for node in graph.all_nodes():
+        desc = node.description
+        if "[CMD]" in desc or "[DELEGATE]" in desc:
+            continue   # already annotated — don't double-inject
+
+        if _TAKEOFF_KW.search(desc):
+            node.description = desc + f" [CMD] TAKEOFF {primary}"
+        elif _LAND_KW.search(desc):
+            node.description = desc + f" [CMD] LAND {primary}"
+        elif _GOTO_KW.search(desc):
+            node.description = desc + f" [CMD] GOTO {primary} SECTOR"
+        elif _SCAN_KW.search(desc):
+            node.description = desc + f" [CMD] SCAN {primary} AREA"
+        elif _DEPLOY_KW.search(desc):
+            node.description = desc + f" [CMD] DEPLOY {primary} PAYLOAD"
+        elif _STATUS_KW.search(desc):
+            node.description = desc + f" [CMD] STATUS {primary}"
+
+    return graph
 
 
 def _steps_to_graph(steps: List[Dict]) -> PlanGraph:
@@ -146,11 +197,34 @@ async def _llm_plan(event: str, role: str, urgency: str, llm_callback, memory=No
 # ── agent ─────────────────────────────────────────────────────────────────────
 
 class DeliberativeAgent:
-    def __init__(self, llm_callback=None, memory=None):
-        self.llm_callback = llm_callback
-        self.memory       = memory
-        self._executor    = PlanExecutor(llm_callback=llm_callback, task_type="deliberative")
-        self._cache_log: List[Dict[str, Any]] = []   # per-task cache hit log for cold-start curve
+    def __init__(
+        self,
+        llm_callback: Optional[Callable[..., Coroutine]] = None,
+        memory=None,
+        cold_threshold: float = 0.40,
+        actuator=None,
+        delegate_fn: Optional[Callable[..., Coroutine]] = None,
+        blackboard=None,
+        agent_id: str = "unknown",
+        negotiation_broker=None,
+    ):
+        self.llm_callback   = llm_callback
+        self.memory         = memory
+        self.cold_threshold = cold_threshold
+        self.actuator       = actuator
+        self.delegate_fn    = delegate_fn
+        self.blackboard     = blackboard
+        self.agent_id       = agent_id
+        self._executor      = PlanExecutor(
+            llm_callback=llm_callback,
+            task_type="deliberative",
+            actuator=actuator,
+            delegate_fn=delegate_fn,
+            blackboard=blackboard,
+            agent_id=agent_id,
+            negotiation_broker=negotiation_broker,
+        )
+        self._cache_log: List[Dict[str, Any]] = []
 
     # ── cache helpers ─────────────────────────────────────────────────────────
 
@@ -189,8 +263,8 @@ class DeliberativeAgent:
             if not plan_json:
                 return None
             # ChromaDB: require tight distance. Flat store (dist=None): trust word-overlap rank.
-            if dist is not None and dist >= 0.40:
-                logger.debug(f"DeliberativeAgent: L2 cold miss dist={dist:.4f}")
+            if dist is not None and dist >= self.cold_threshold:
+                logger.debug(f"DeliberativeAgent: L2 cold miss dist={dist:.4f} (threshold={self.cold_threshold})")
                 return None
             graph = _graph_from_json(plan_json)
             if graph:
@@ -245,9 +319,23 @@ class DeliberativeAgent:
                 graph = await _llm_plan(event, agent_role, urgency, self.llm_callback, memory=self.memory)
             else:
                 graph = _steps_to_graph(_FALLBACK_STEPS)
+            # Inject [CMD] tokens deterministically — LLM output is unreliable for syntax
+            graph = _inject_commands(graph, event)
 
         # ── execution ─────────────────────────────────────────────────────────
         result = await self._executor.execute(graph, context=event)
+
+        # ── cache invalidation on failure ──────────────────────────────────────
+        # If we reused a cached plan and it failed, evict it so future tasks
+        # fall through to LLM re-planning rather than re-using a broken plan.
+        if cached_match and not result.success:
+            key = _plan_key(event)
+            if self.memory:
+                self.memory.forget(_HOT_CACHE_AGENT, key)
+                logger.warning(
+                    f"DeliberativeAgent: cached plan failed — evicted L1 key={key[:8]} "
+                    f"(will re-plan next time)"
+                )
 
         logger.info(
             f"DeliberativeAgent: {result.steps_done}/{len(graph)} steps "

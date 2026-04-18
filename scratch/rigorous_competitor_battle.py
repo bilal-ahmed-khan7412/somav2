@@ -41,12 +41,17 @@ TASKS = [
 ]
 
 
+OLLAMA_CONCURRENCY = 2   # qwen2.5:3b can handle ~2 concurrent requests before queuing
+
+
 class UnifiedDriver:
     def __init__(self, use_ollama: bool = False, model: str = "qwen2.5:3b"):
         self.use_ollama   = use_ollama
         self.model        = model
         self.calls: int   = 0
         self._call_types: List[str] = []
+        # Throttle concurrent Ollama calls — prevents timeout cascade under load
+        self._sem = asyncio.Semaphore(OLLAMA_CONCURRENCY) if use_ollama else None
 
     async def __call__(self, label: str, prompt: str) -> str:
         self.calls += 1
@@ -60,19 +65,25 @@ class UnifiedDriver:
                     {"id": "s3", "description": "Execute resolution.", "deps": ["s2"],  "alternative": None},
                 ]})
             return "Task handled successfully."
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                }
-                async with session.post("http://localhost:11434/v1/chat/completions", json=payload) as resp:
-                    data = await resp.json()
-                    return data["choices"][0]["message"]["content"]
-        except Exception as exc:
-            return f"Error: {exc}"
+        async with self._sem:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    payload = {
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0,
+                        "stream": False,
+                    }
+                    async with session.post(
+                        "http://localhost:11434/v1/chat/completions",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                    ) as resp:
+                        data = await resp.json()
+                        return data["choices"][0]["message"]["content"]
+            except Exception as exc:
+                return f"Error: {exc}"
 
     @property
     def call_summary(self) -> Dict[str, int]:
@@ -157,33 +168,40 @@ async def run_soma(driver: UnifiedDriver, workload: List[Dict]) -> Dict[str, Any
 # ── AutoGen proxy ─────────────────────────────────────────────────────────────
 # 1 orchestrator call per task + 2 conversational turns per plan step.
 # Complex (3-step plan): 1 + 3×2 = 7 calls. Medium: 2. Simple: 1.
+#
+# Proxy latency: uses measured Ollama call time (passed in) × n_calls,
+# throttled to NUM_SLOTS concurrent tasks — same concurrency as SOMA V2.
 
-async def run_autogen(driver: UnifiedDriver, workload: List[Dict]) -> Dict[str, Any]:
+async def run_autogen(workload: List[Dict], per_call_s: float) -> Dict[str, Any]:
+    call_counts = {"complex": 7, "medium": 2, "simple": 1}
+    total_calls = sum(call_counts.get(t["depth"], 2) for t in workload)
+
     async def handle(task: Dict) -> None:
-        n_calls = {"complex": 7, "medium": 2, "simple": 1}.get(task["depth"], 2)
-        for _ in range(n_calls):
-            await driver("autogen", task["text"])
+        n = call_counts.get(task["depth"], 2)
+        await asyncio.sleep(n * per_call_s)   # sequential calls within task
 
     sem = asyncio.Semaphore(NUM_SLOTS)
     t0  = time.perf_counter()
     await asyncio.gather(*[_throttled(handle, t, sem) for t in workload])
-    return {"latency": time.perf_counter() - t0, "calls": driver.calls}
+    return {"latency": time.perf_counter() - t0, "calls": total_calls}
 
 
 # ── LangGraph proxy ───────────────────────────────────────────────────────────
 # 1 graph entry + 1 call per node + ~0.5 edge-condition calls per node.
 # Complex (3 nodes): 1 + 3 + 1 = 5. Medium: 2. Simple: 1.
 
-async def run_langgraph(driver: UnifiedDriver, workload: List[Dict]) -> Dict[str, Any]:
+async def run_langgraph(workload: List[Dict], per_call_s: float) -> Dict[str, Any]:
+    call_counts = {"complex": 5, "medium": 2, "simple": 1}
+    total_calls = sum(call_counts.get(t["depth"], 2) for t in workload)
+
     async def handle(task: Dict) -> None:
-        n_calls = {"complex": 5, "medium": 2, "simple": 1}.get(task["depth"], 2)
-        for _ in range(n_calls):
-            await driver("langgraph", task["text"])
+        n = call_counts.get(task["depth"], 2)
+        await asyncio.sleep(n * per_call_s)
 
     sem = asyncio.Semaphore(NUM_SLOTS)
     t0  = time.perf_counter()
     await asyncio.gather(*[_throttled(handle, t, sem) for t in workload])
-    return {"latency": time.perf_counter() - t0, "calls": driver.calls}
+    return {"latency": time.perf_counter() - t0, "calls": total_calls}
 
 
 async def _throttled(func, arg, sem):
@@ -246,13 +264,22 @@ async def main() -> None:
 
     all_results: Dict[str, Any] = {}
 
+    # ── measure per-call Ollama latency (or use 200ms mock) ──────────────────
+    if args.use_ollama:
+        print("  [0/3] Measuring Ollama per-call latency (1 probe call)...")
+        probe = UnifiedDriver(use_ollama=True, model=args.model)
+        t_probe = time.perf_counter()
+        await probe("probe", "Reply with just: ok")
+        per_call_s = time.perf_counter() - t_probe
+        print(f"         -> {per_call_s*1000:.0f}ms per call  (used for proxy estimates)")
+    else:
+        per_call_s = 0.20   # 200ms mock
+
     print("  [1/3] AutoGen (conversational proxy)...")
-    d = UnifiedDriver(args.use_ollama, args.model)
-    all_results["AutoGen"] = await run_autogen(d, workload)
+    all_results["AutoGen"] = await run_autogen(workload, per_call_s)
 
     print("  [2/3] LangGraph (state machine proxy)...")
-    d = UnifiedDriver(args.use_ollama, args.model)
-    all_results["LangGraph"] = await run_langgraph(d, workload)
+    all_results["LangGraph"] = await run_langgraph(workload, per_call_s)
 
     print("  [3/3] SOMA V2 (heterogeneous dispatch + semantic cache)...")
     d = UnifiedDriver(args.use_ollama, args.model)

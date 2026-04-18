@@ -29,7 +29,11 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any, Callable, Coroutine, Dict, List, Optional
+
+_DELEGATE_RE = re.compile(r'\[DELEGATE\]\s*(.+)', re.IGNORECASE)
+_CMD_UNIT_RE = re.compile(r'\[CMD\]\s+\w+\s+([A-Z]\d+)', re.IGNORECASE)  # [CMD] VERB UNIT
 
 logger = logging.getLogger("SOMA_V2.PLANNER")
 
@@ -155,15 +159,52 @@ class PlanExecutor:
         self,
         llm_callback: Optional[Callable[..., Coroutine]],
         task_type: str = "deliberative",
+        actuator: Optional[Any] = None,
+        delegate_fn: Optional[Callable[..., Coroutine]] = None,
+        blackboard: Optional[Any] = None,
+        agent_id: str = "unknown",
+        negotiation_broker: Optional[Any] = None,
+        claim_timeout_s: float = 2.0,
     ) -> None:
-        self.llm_callback = llm_callback
-        self.task_type    = task_type
+        self.llm_callback       = llm_callback
+        self.task_type          = task_type
+        self.actuator           = actuator
+        self.delegate_fn        = delegate_fn
+        self.blackboard         = blackboard
+        self.agent_id           = agent_id
+        self.negotiation_broker = negotiation_broker
+        self.claim_timeout_s    = claim_timeout_s
+        self._negotiated_load   = 0   # count of negotiated steps currently executing
+
+        # Self-register with broker so other agents can propose steps to us
+        if negotiation_broker is not None:
+            negotiation_broker.register(agent_id, self)
+
+    async def _execute_negotiated_step(self, step_desc: str, context: str) -> str:
+        """
+        Execute a single step on behalf of another agent (negotiation accept path).
+        Increments _negotiated_load so the broker can back-pressure further proposals.
+        """
+        self._negotiated_load += 1
+        try:
+            node = PlanNode(node_id="__neg__", description=step_desc, deps=[])
+            await self._run_node(node, context)
+            return node.output or "[negotiated step completed]"
+        finally:
+            self._negotiated_load = max(0, self._negotiated_load - 1)
 
     async def _run_node(self, node: PlanNode, context: str) -> None:
         node.status = NodeStatus.RUNNING
         t0 = time.perf_counter()
         try:
-            if self.llm_callback:
+            # ── [DELEGATE] — route sub-task to another agent via A2A ─────────
+            delegate_match = _DELEGATE_RE.search(node.description)
+            if delegate_match and self.delegate_fn:
+                sub_task = delegate_match.group(1).strip()
+                logger.info(f"PlanNode '{node.node_id}': delegating sub-task '{sub_task[:60]}'")
+                result = await self.delegate_fn(sub_task, urgency="high")
+                node.output = f"[DELEGATED] {result}"
+            elif self.llm_callback:
                 prompt = (
                     f"Context: {context}\n\n"
                     f"Step: {node.description}\n\n"
@@ -172,6 +213,47 @@ class PlanExecutor:
                 node.output = await self.llm_callback(self.task_type, prompt)
             else:
                 node.output = f"[stub] completed: {node.description}"
+
+            # ── [CMD] — physical actuation bridge ────────────────────────────
+            if self.actuator and "[CMD]" in node.description:
+                cmd_part = node.description.split("[CMD]")[-1].strip()
+                cmd_part = cmd_part.split("[DELEGATE]")[0].strip()
+
+                # Claim the unit on the shared blackboard before actuating
+                unit_match = _CMD_UNIT_RE.search(node.description)
+                unit_id    = unit_match.group(1) if unit_match else None
+                claimed    = False
+                if unit_id and self.blackboard:
+                    claimed = await self.blackboard.claim(unit_id, self.agent_id, node.node_id, timeout_s=self.claim_timeout_s)
+                    if not claimed:
+                        # Try to negotiate: propose the step to whoever owns the unit
+                        if self.negotiation_broker:
+                            neg = await self.negotiation_broker.propose(
+                                from_agent=self.agent_id,
+                                step_desc=node.description,
+                                unit_id=unit_id,
+                                context=context,
+                            )
+                            if neg.accepted:
+                                node.output = (
+                                    f"[NEGOTIATED→{neg.by_agent}] {neg.result}"
+                                )
+                                node.status = NodeStatus.DONE
+                                node.latency_ms = neg.latency_ms
+                                return
+                        raise RuntimeError(
+                            f"Resource conflict: unit '{unit_id}' unavailable "
+                            f"and negotiation failed — node will backtrack"
+                        )
+                try:
+                    act_success = await self.actuator.execute_command(cmd_part)
+                    if not act_success:
+                        raise RuntimeError(f"Actuator failed: {cmd_part}")
+                    node.output = (node.output or "") + f" | [ACTUATED: {cmd_part}]"
+                finally:
+                    if unit_id and self.blackboard and claimed:
+                        await self.blackboard.release(unit_id, self.agent_id, node.node_id)
+
             node.status = NodeStatus.DONE
         except Exception as exc:
             logger.warning(f"PlanNode '{node.node_id}' failed: {exc}")

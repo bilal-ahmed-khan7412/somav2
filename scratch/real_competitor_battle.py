@@ -34,6 +34,13 @@ import sys
 import time
 from typing import Any, Dict, List, TypedDict
 
+# Module-level TypedDict so LangGraph's get_type_hints() can resolve it
+class LGState(TypedDict):
+    task:   str
+    depth:  str
+    plan:   str
+    result: str
+
 sys.path.insert(0, "src")
 
 from soma_v2.core.director import AgentDirector
@@ -212,17 +219,12 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
                     await _mock_llm(task["text"], depth, counter)
                 return
 
-            # Real LangGraph graph  build per-task (stateless, thread-safe)
+            # Real LangGraph graph — built once outside the per-task loop
+            # (graph is stateless; ainvoke takes per-call state)
             from langgraph.graph import StateGraph, END
             from langchain_core.messages import HumanMessage
 
-            class State(TypedDict):
-                task: str
-                depth: str
-                plan: str
-                result: str
-
-            async def classify_node(state: State) -> State:
+            async def classify_node(state: LGState) -> LGState:
                 msg = await llm.ainvoke([HumanMessage(
                     content=f"Classify this task as simple/medium/complex in one word: {state['task']}"
                 )])
@@ -230,7 +232,7 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
                 await counter.increment(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
                 return {**state, "depth": msg.content.strip().split()[0].lower()}
 
-            async def plan_node(state: State) -> State:
+            async def plan_node(state: LGState) -> LGState:
                 msg = await llm.ainvoke([HumanMessage(
                     content=f"List 3 steps to solve: {state['task']}"
                 )])
@@ -238,7 +240,7 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
                 await counter.increment(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
                 return {**state, "plan": msg.content}
 
-            async def execute_node(state: State) -> State:
+            async def execute_node(state: LGState) -> LGState:
                 msg = await llm.ainvoke([HumanMessage(
                     content=f"Execute this plan and confirm success:\n{state['plan']}"
                 )])
@@ -246,22 +248,19 @@ async def run_langgraph(workload: List[Dict], use_ollama: bool, model: str) -> D
                 await counter.increment(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
                 return {**state, "result": msg.content}
 
-            def route(state) -> str:
-                d = state.get("depth", depth)
-                if d == "simple":
-                    return END
-                return "plan"
+            def route(state: LGState) -> str:
+                return END if state.get("depth", "complex") == "simple" else "plan"
 
-            def after_plan(state) -> str:
-                return "execute" if state.get("depth", depth) == "complex" else END
+            def after_plan(state: LGState) -> str:
+                return "execute" if state.get("depth", "complex") == "complex" else END
 
-            builder = StateGraph(State)
+            builder = StateGraph(LGState)
             builder.add_node("classify", classify_node)
             builder.add_node("plan",     plan_node)
             builder.add_node("execute",  execute_node)
             builder.set_entry_point("classify")
             builder.add_conditional_edges("classify", route, {END: END, "plan": "plan"})
-            builder.add_edge("plan", "execute" if depth == "complex" else END)
+            builder.add_conditional_edges("plan", after_plan, {END: END, "execute": "execute"})
             builder.add_edge("execute", END)
             graph = builder.compile()
 

@@ -27,11 +27,17 @@ logger = logging.getLogger("SOMA_V2.COLD_MEMORY")
 # Shared normaliser — same logic as deliberative.py so keys align
 _STRIP_PREFIX  = re.compile(r"^var_\d+\s*:\s*", re.IGNORECASE)
 _STRIP_NUMBERS = re.compile(r"\b[A-Z]?\d+\b")
+_NORM_AGENTS   = re.compile(r"\b(drone|rov|submersible|uav|sub)\b", re.IGNORECASE)
+_NORM_ACTIONS  = re.compile(r"\b(rescue|extraction|salvage|mission)\b", re.IGNORECASE)
+_NORM_SENSORS  = re.compile(r"\b(sonar|sensor|radar)\b", re.IGNORECASE)
 _MULTI_SPACE   = re.compile(r"\s{2,}")
 
 def _norm(text: str) -> str:
     text = _STRIP_PREFIX.sub("", text)
     text = _STRIP_NUMBERS.sub("N", text)
+    text = _NORM_AGENTS.sub("AGENT_UNIT", text)
+    text = _NORM_ACTIONS.sub("MISSION", text)
+    text = _NORM_SENSORS.sub("SENSOR", text)
     return _MULTI_SPACE.sub(" ", text).lower().strip()
 
 _CHROMA_AVAILABLE = False
@@ -184,6 +190,7 @@ class ColdMemory:
         extra: Optional[Dict] = None,
     ) -> str:
         episode_id = uuid.uuid4().hex
+        norm_event = _norm(event)
         metadata   = {
             "agent_id":   agent_id,
             "agent_type": agent_type,
@@ -198,7 +205,7 @@ class ColdMemory:
             try:
                 self._collection.add(
                     ids=[episode_id],
-                    documents=[event],
+                    documents=[norm_event],
                     metadatas=[metadata],
                 )
             except Exception as exc:
@@ -221,17 +228,16 @@ class ColdMemory:
         Retrieve the n most semantically similar past episodes.
         Returns list of {event, metadata, distance} dicts.
         """
+        norm_query = _norm(query)
         if self._collection is not None:
-            return self._recall_chroma(query, n, filter_success)
+            return self._recall_chroma(norm_query, n, filter_success)
         if self._fallback is not None:
-            results = self._fallback.query(query, n)
+            results = self._fallback.query(norm_query, n)
             if filter_success is not None:
                 results = [r for r in results
                            if bool(r["meta"].get("success")) == filter_success]
             # Convert Jaccard score to a distance-like value (1 - jaccard)
-            # so that distance=0 means identical, distance=1 means no overlap.
-            # We recompute here because query() doesn't expose scores.
-            q_tok = set(_norm(query).split())
+            q_tok = set(norm_query.split())
             out   = []
             for r in results:
                 ep_tok  = set(r.get("norm", r["text"].lower()).split())

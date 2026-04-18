@@ -40,7 +40,7 @@ class HierarchicalMemory:
         self,
         hot_capacity:    int   = 256,
         hot_ttl:         float = 300.0,
-        cold_persist:    Optional[str] = None,
+        cold_persist:    Optional[str] = "./soma_cache",
         cold_collection: str  = "soma_episodes",
         cold_enabled:    bool = True,
     ) -> None:
@@ -52,6 +52,10 @@ class HierarchicalMemory:
         self._worker.start()
         cold_info = self.cold.backend if self.cold else "disabled"
         logger.info(f"HierarchicalMemory ready — hot(cap={hot_capacity} ttl={hot_ttl}s) cold({cold_info})")
+
+    def sync(self) -> None:
+        """Block until all background cold-memory writes are complete."""
+        self._write_q.join()
 
     def _cold_writer(self) -> None:
         while True:
