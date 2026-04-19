@@ -47,18 +47,19 @@ try:
 except ImportError:
     pass
 
-_ST_AVAILABLE = False
+import importlib.util as _ilu
+_ST_AVAILABLE = _ilu.find_spec("sentence_transformers") is not None
+del _ilu
+
+# Model is loaded lazily inside _STEmbeddingFunction.__call__ the first time
+# ChromaDB actually needs an embedding — never at import time.
 _st_model = None
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
-except ImportError:
-    pass
 
 
 def _get_st_model():
     global _st_model
     if _st_model is None:
+        from sentence_transformers import SentenceTransformer
         logger.info("ColdMemory: loading sentence-transformers all-MiniLM-L6-v2 ...")
         _st_model = SentenceTransformer("all-MiniLM-L6-v2")
         logger.info("ColdMemory: embedding model ready")

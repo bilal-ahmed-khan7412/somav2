@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from ..core.planner import PlanGraph, PlanNode, PlanExecutor
@@ -57,12 +58,12 @@ Memory (Relevant Historical Cases):
 {memory}
 
 Return ONLY valid JSON in this exact schema — no markdown, no extra text:
-{{
+{
   "steps": [
-    {{"id": "s1", "description": "...", "deps": [], "alternative": null}},
-    {{"id": "s2", "description": "...", "deps": ["s1"], "alternative": null}}
+    {"id": "s1", "description": "...", "deps": [], "command": "TAKEOFF A12", "alternative": null},
+    {"id": "s2", "description": "...", "deps": ["s1"], "command": "GOTO A12 BASE", "alternative": null}
   ]
-}}
+}
 
 Rules:
 - 3 to 5 steps maximum.
@@ -71,8 +72,8 @@ Rules:
 - Descriptions must be concrete and actionable.
 - If memory shows FAILED cases, add an extra verification step or alternative path.
 - If memory shows SUCCESS cases with fewer steps, prefer the simpler plan.
-- If the step requires physical movement or drone action, append "[CMD] TAKEOFF <unit>", "[CMD] GOTO <unit> <target>", or "[CMD] LAND <unit>".
-- If the step requires a separate agent to handle a sub-task concurrently, append "[DELEGATE] <sub-task description>".
+- CRITICAL: If the step requires physical movement or drone action, you MUST populate the "command" field with a string like: "TAKEOFF <unit>", "GOTO <unit> <target>", or "LAND <unit>". Use the exact unit ID (e.g. A12) from the task.
+- If the step requires a separate agent to handle a sub-task concurrently, you MUST append "[DELEGATE] <sub-task description>" to the "description" field.
 """
 
 _FALLBACK_STEPS = [
@@ -94,12 +95,12 @@ _HOT_CACHE_AGENT = "__plan_cache__"   # namespace in HotMemory for cross-task pl
 # Runs after plan generation so the LLM never needs to get the syntax right.
 
 _UNIT_RE      = re.compile(r'\b([A-Z]\d+)\b')           # e.g. A12, B4, C3
-_TAKEOFF_KW   = re.compile(r'\b(takeoff|launch|ascend|lift.?off|deploy unit)\b', re.I)
-_GOTO_KW      = re.compile(r'\b(navigate|proceed|move|fly|travel|head to|route)\b', re.I)
-_LAND_KW      = re.compile(r'\b(land|descend|RTB|return to base|touch.?down)\b', re.I)
-_SCAN_KW      = re.compile(r'\b(scan|sweep|survey|search area|recon)\b', re.I)
-_DEPLOY_KW    = re.compile(r'\b(deploy|drop|release|deliver)\b', re.I)
-_STATUS_KW    = re.compile(r'\b(status|ping|check|verify|confirm online)\b', re.I)
+_TAKEOFF_KW   = re.compile(r'\b(takeoff|launch|ascend|lift.?off|deploy unit|activate)\b', re.I)
+_GOTO_KW      = re.compile(r'\b(navigate|proceed|move|fly|travel|head to|route|transit|relocate)\b', re.I)
+_LAND_KW      = re.compile(r'\b(land|descend|RTB|return to base|touch.?down|deactivate|power down)\b', re.I)
+_SCAN_KW      = re.compile(r'\b(scan|sweep|survey|search area|recon|inspect|examine)\b', re.I)
+_DEPLOY_KW    = re.compile(r'\b(deploy|drop|release|deliver|attach|hook)\b', re.I)
+_STATUS_KW    = re.compile(r'\b(status|ping|check|verify|confirm online|health|telemetry)\b', re.I)
 
 
 def _inject_commands(graph: PlanGraph, event: str) -> PlanGraph:
@@ -113,8 +114,8 @@ def _inject_commands(graph: PlanGraph, event: str) -> PlanGraph:
 
     for node in graph.all_nodes():
         desc = node.description
-        if "[CMD]" in desc or "[DELEGATE]" in desc:
-            continue   # already annotated — don't double-inject
+        if node.command or "[CMD]" in desc or "[DELEGATE]" in desc:
+            continue   # already annotated or structured — don't double-inject
 
         if _TAKEOFF_KW.search(desc):
             node.description = desc + f" [CMD] TAKEOFF {primary}"
@@ -140,6 +141,7 @@ def _steps_to_graph(steps: List[Dict]) -> PlanGraph:
             description=s["description"],
             deps=s.get("deps") or [],
             alternative=s.get("alternative"),
+            command=s.get("command"),
         ))
     return g
 
@@ -213,6 +215,7 @@ class DeliberativeAgent:
         blackboard=None,
         agent_id: str = "unknown",
         negotiation_broker=None,
+        **kwargs,
     ):
         self.llm_callback   = llm_callback
         self.memory         = memory
@@ -229,6 +232,7 @@ class DeliberativeAgent:
             blackboard=blackboard,
             agent_id=agent_id,
             negotiation_broker=negotiation_broker,
+            **kwargs,
         )
         self._cache_log: List[Dict[str, Any]] = []
 
@@ -308,9 +312,12 @@ class DeliberativeAgent:
             if graph:
                 cached_match = True
                 cache_level  = "L2-cold"
+        
+        # Apply command injection to cached plans (Priority Fix)
+        if graph:
+            graph = _inject_commands(graph, event)
 
         # ── log hit/miss (Priority 4) ─────────────────────────────────────────
-        import time
         self._cache_log.append({
             "task_num": len(self._cache_log) + 1,
             "hit": cached_match,

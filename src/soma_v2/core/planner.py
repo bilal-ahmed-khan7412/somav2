@@ -67,6 +67,7 @@ class PlanNode:
     description: str
     deps:        List[str]       = field(default_factory=list)
     alternative: Optional[str]  = None
+    command:     Optional[str]  = None   # Structured command (e.g. "GOTO A12 SECTOR")
 
     # runtime state — set by Executor
     status:     NodeStatus      = field(default=NodeStatus.PENDING, init=False)
@@ -165,6 +166,8 @@ class PlanExecutor:
         agent_id: str = "unknown",
         negotiation_broker: Optional[Any] = None,
         claim_timeout_s: float = 2.0,
+        delegate_timeout_s: float = 10.0,
+        resource_pools: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.llm_callback       = llm_callback
         self.task_type          = task_type
@@ -174,6 +177,8 @@ class PlanExecutor:
         self.agent_id           = agent_id
         self.negotiation_broker = negotiation_broker
         self.claim_timeout_s    = claim_timeout_s
+        self.delegate_timeout_s = delegate_timeout_s
+        self.resource_pools     = resource_pools or {}
         self._negotiated_load   = 0   # count of negotiated steps currently executing
 
         # Self-register with broker so other agents can propose steps to us
@@ -202,8 +207,14 @@ class PlanExecutor:
             if delegate_match and self.delegate_fn:
                 sub_task = delegate_match.group(1).strip()
                 logger.info(f"PlanNode '{node.node_id}': delegating sub-task '{sub_task[:60]}'")
-                result = await self.delegate_fn(sub_task, urgency="high")
-                node.output = f"[DELEGATED] {result}"
+                try:
+                    result = await asyncio.wait_for(
+                        self.delegate_fn(sub_task, urgency="high"),
+                        timeout=self.delegate_timeout_s
+                    )
+                    node.output = f"[DELEGATED] {result}"
+                except asyncio.TimeoutError:
+                    raise RuntimeError(f"Delegation timed out after {self.delegate_timeout_s}s")
             elif self.llm_callback:
                 prompt = (
                     f"Context: {context}\n\n"
@@ -214,45 +225,74 @@ class PlanExecutor:
             else:
                 node.output = f"[stub] completed: {node.description}"
 
-            # ── [CMD] — physical actuation bridge ────────────────────────────
-            if self.actuator and "[CMD]" in node.description:
-                cmd_part = node.description.split("[CMD]")[-1].strip()
-                cmd_part = cmd_part.split("[DELEGATE]")[0].strip()
+            # ── Actuation Bridge: [CMD] or structured command ──────────────
+            if self.actuator:
+                cmd_part = None
+                if node.command:
+                    cmd_part = node.command
+                elif "[CMD]" in node.description:
+                    cmd_part = node.description.split("[CMD]")[-1].strip()
+                    cmd_part = cmd_part.split("[DELEGATE]")[0].strip()
 
-                # Claim the unit on the shared blackboard before actuating
-                unit_match = _CMD_UNIT_RE.search(node.description)
-                unit_id    = unit_match.group(1) if unit_match else None
-                claimed    = False
-                if unit_id and self.blackboard:
-                    claimed = await self.blackboard.claim(unit_id, self.agent_id, node.node_id, timeout_s=self.claim_timeout_s)
-                    if not claimed:
-                        # Try to negotiate: propose the step to whoever owns the unit
-                        if self.negotiation_broker:
-                            neg = await self.negotiation_broker.propose(
-                                from_agent=self.agent_id,
-                                step_desc=node.description,
-                                unit_id=unit_id,
-                                context=context,
-                            )
-                            if neg.accepted:
-                                node.output = (
-                                    f"[NEGOTIATED→{neg.by_agent}] {neg.result}"
+                if cmd_part:
+                    # Claim the unit on the shared blackboard before actuating
+                    unit_match  = _CMD_UNIT_RE.search(node.description)
+                    unit_id     = unit_match.group(1) if unit_match else None
+                    actual_unit = unit_id   # may differ when pool-claimed
+                    claimed     = False
+                    pool_claimed = False    # True if claimed via pool (released at task end)
+                    if unit_id and self.blackboard:
+                        pool = self.resource_pools.get(unit_id)
+                        if pool is not None:
+                            existing = self._task_pool_claims.get(pool.pool_id)
+                            if existing is not None:
+                                # Reuse the unit claimed earlier in this task (reentrant)
+                                actual_unit = existing
+                                claimed = await self.blackboard.claim(actual_unit, self.agent_id, node.node_id, timeout_s=self.claim_timeout_s)
+                            else:
+                                # First pool-eligible node: grab any free drone
+                                actual_unit = await pool.claim_any(
+                                    self.agent_id, self.blackboard, node.node_id,
+                                    timeout_s=self.claim_timeout_s,
                                 )
-                                node.status = NodeStatus.DONE
-                                node.latency_ms = neg.latency_ms
-                                return
-                        raise RuntimeError(
-                            f"Resource conflict: unit '{unit_id}' unavailable "
-                            f"and negotiation failed — node will backtrack"
-                        )
-                try:
-                    act_success = await self.actuator.execute_command(cmd_part)
-                    if not act_success:
-                        raise RuntimeError(f"Actuator failed: {cmd_part}")
-                    node.output = (node.output or "") + f" | [ACTUATED: {cmd_part}]"
-                finally:
-                    if unit_id and self.blackboard and claimed:
-                        await self.blackboard.release(unit_id, self.agent_id, node.node_id)
+                                claimed = actual_unit is not None
+                                if claimed:
+                                    self._task_pool_claims[pool.pool_id] = actual_unit
+                                    pool_claimed = True  # held until task end
+                            if claimed and actual_unit != unit_id:
+                                cmd_part = cmd_part.replace(unit_id, actual_unit, 1)
+                        else:
+                            claimed = await self.blackboard.claim(unit_id, self.agent_id, node.node_id, timeout_s=self.claim_timeout_s)
+
+                        if not claimed:
+                            # Try to negotiate: propose the step to whoever owns the unit
+                            if self.negotiation_broker:
+                                neg = await self.negotiation_broker.propose(
+                                    from_agent=self.agent_id,
+                                    step_desc=node.description,
+                                    unit_id=unit_id,
+                                    context=context,
+                                )
+                                if neg.accepted:
+                                    node.output = (
+                                        f"[NEGOTIATED→{neg.by_agent}] {neg.result}"
+                                    )
+                                    node.status = NodeStatus.DONE
+                                    node.latency_ms = neg.latency_ms
+                                    return
+                            raise RuntimeError(
+                                f"Resource conflict: unit '{unit_id}' unavailable "
+                                f"and negotiation failed — node will backtrack"
+                            )
+                    try:
+                        act_success = await self.actuator.execute_command(cmd_part)
+                        if not act_success:
+                            raise RuntimeError(f"Actuator failed: {cmd_part}")
+                        node.output = (node.output or "") + f" | [ACTUATED: {cmd_part}]"
+                    finally:
+                        # Pool-claimed units are held for the full task — released in execute()
+                        if self.blackboard and claimed and not pool_claimed:
+                            await self.blackboard.release(actual_unit, self.agent_id, node.node_id)
 
             node.status = NodeStatus.DONE
         except Exception as exc:
@@ -266,6 +306,7 @@ class PlanExecutor:
         """Run all nodes in topological wave order with backtrack on failure."""
         t_total = time.perf_counter()
         backtracks_used: set = set()
+        self._task_pool_claims: Dict[str, str] = {}  # pool_id -> actual_unit; held for task duration
 
         # We re-compute waves after any backtrack insertion
         max_iterations = len(graph) * 2 + 5
@@ -361,6 +402,13 @@ class PlanExecutor:
             summary_parts.append(f"Failed: {[n.node_id for n in fail_nodes]}.")
         if backtracks_used:
             summary_parts.append(f"Backtracks: {list(backtracks_used)}.")
+
+        # Release any units held at task-level via pool claiming
+        for pool_id, actual_unit in self._task_pool_claims.items():
+            pool = next((p for p in self.resource_pools.values() if p.pool_id == pool_id), None)
+            if pool and self.blackboard:
+                await pool.release(actual_unit, self.agent_id, "__task_end__", self.blackboard)
+        self._task_pool_claims = {}
 
         return PlanResult(
             success=success,

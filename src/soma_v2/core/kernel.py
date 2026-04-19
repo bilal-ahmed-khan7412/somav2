@@ -12,6 +12,7 @@ then routes to the appropriate agent type:
 import asyncio
 import logging
 import time
+import uuid
 from typing import List, Tuple, Dict, Any, Optional
 
 from .depth_classifier import DepthClassifier, DEPTH_SIMPLE, DEPTH_MEDIUM, DEPTH_COMPLEX
@@ -92,12 +93,14 @@ class V2Kernel:
         actuator: Optional[Any] = None,
         delegate_fn=None,
         blackboard=None,
-        agent_id: str = "unknown",
+        agent_id: Optional[str] = None,
         negotiation_broker=None,
+        **kwargs,
     ):
         self.llm_callback = llm_callback
         self.memory       = memory
         self.actuator     = actuator
+        self.agent_id     = agent_id or f"node_{uuid.uuid4().hex[:8]}"
 
         _llm = _make_resilient_llm(llm_callback, timeout_s=llm_timeout_s, max_retries=llm_max_retries, max_concurrent=llm_max_concurrent)
 
@@ -112,8 +115,9 @@ class V2Kernel:
         self.deliberative = DeliberativeAgent(
             llm_callback=_llm, memory=memory, cold_threshold=cold_threshold,
             actuator=actuator, delegate_fn=delegate_fn,
-            blackboard=blackboard, agent_id=agent_id,
+            blackboard=blackboard, agent_id=self.agent_id,
             negotiation_broker=negotiation_broker,
+            **kwargs,
         )
 
         self._dispatch_log: List[Dict[str, Any]] = []
@@ -138,19 +142,28 @@ class V2Kernel:
         """
         t0 = time.perf_counter()
 
-        if forced_depth:
+        # V2 Hybrid Router (Option 3): Fast-path rule routing
+        # Skips ML inference entirely for uncontested routine tasks.
+        is_routine = any(kw in event.lower() for kw in ["status", "ping", "verify", "heartbeat"])
+        if not forced_depth and not contested and urgency in ("low", "medium") and is_routine:
+            depth, depth_prob = DEPTH_SIMPLE, 1.0
+            agent_type = "hybrid_router"
+            logger.info(f"V2Kernel: Hybrid Fast-Path matched (urgency={urgency}) -> {depth}")
+        elif forced_depth:
             depth, depth_prob = forced_depth, 1.0
+            agent_type = None  # determined below
         else:
             depth, depth_prob = self.classifier.predict(
                 agent_role, confidence, urgency, contested, reroute_attempts,
                 event_text=event,
             )
+            agent_type = None  # determined below
         
         logger.info(f"V2Kernel: depth={depth} p={depth_prob:.3f} event='{event[:60]}'")
 
         if depth == DEPTH_SIMPLE:
             result = await self.reactive.handle(event, agent_role, confidence, urgency)
-            agent_type = "reactive"
+            if not agent_type: agent_type = "reactive"
         elif depth == DEPTH_COMPLEX:
             result = await self.deliberative.handle(event, agent_role, confidence, urgency)
             agent_type = "deliberative"

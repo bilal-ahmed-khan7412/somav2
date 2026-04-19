@@ -78,3 +78,38 @@ class MockDroneActuator(Actuator):
 
         logger.warning(f"MockDroneActuator: unknown command verb '{verb}' in '{raw}'")
         return False
+
+
+class DeduplicatingActuator(Actuator):
+    """
+    Wraps any Actuator. Identical concurrent commands share one Future.
+    TAKEOFF B1 issued by 5 agents simultaneously → executed once, all 5 share result.
+    """
+
+    def __init__(self, inner: Actuator) -> None:
+        self._inner   = inner
+        self._inflight: dict[str, asyncio.Future] = {}
+        self._lock    = asyncio.Lock()
+
+    async def execute_command(self, cmd_string: str) -> bool:
+        key = cmd_string.strip().upper()
+        async with self._lock:
+            if key in self._inflight:
+                fut = self._inflight[key]
+            else:
+                loop = asyncio.get_event_loop()
+                fut  = loop.create_future()
+                self._inflight[key] = fut
+                asyncio.create_task(self._run(key, cmd_string, fut))
+        return await asyncio.shield(fut)
+
+    async def _run(self, key: str, cmd: str, fut: asyncio.Future) -> None:
+        try:
+            result = await self._inner.execute_command(cmd)
+            if not fut.done():
+                fut.set_result(result)
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+        finally:
+            self._inflight.pop(key, None)

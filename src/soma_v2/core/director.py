@@ -30,8 +30,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
-from .a2a import A2ABus, A2AMessage, MsgType, ResourceBlackboard
-from .negotiation import NegotiationBroker
+from .a2a import A2ABus, A2AMessage, MsgType
+from .blackboard import ResourceBlackboard
+from .broker import NegotiationBroker
 from .kernel import V2Kernel
 from ..memory.hierarchical import HierarchicalMemory
 
@@ -192,6 +193,7 @@ class AgentDirector:
         self._dir_queue   = self._bus.register(self._director_id)
         self._stats: Dict[str, int]   = {"tasks_assigned": 0, "tasks_delegated": 0, "tasks_failed": 0}
         self._rr_counter: int         = 0
+        self._pool_map: Dict[str, Any] = {}   # unit_id -> ResourcePool; shared by reference with all kernels
 
     def add_slot(
         self,
@@ -210,12 +212,20 @@ class AgentDirector:
             actuator=self.actuator, delegate_fn=_delegate,
             blackboard=self._blackboard, agent_id=slot_id,
             negotiation_broker=self._negotiator,
+            resource_pools=self._pool_map,
             **self._kernel_kwargs,
         )
         slot   = AgentSlot(slot_id=slot_id, role=role, capacity=capacity, kernel=kernel, memory=self._memory)
         slot.attach(self._bus)
         self._slots[slot_id] = slot
         logger.info(f"AgentDirector: added slot '{slot_id}' role={role}")
+        return self
+
+    def register_pool(self, pool: Any) -> "AgentDirector":
+        """Register a ResourcePool so kernels use pool claiming for its units."""
+        for unit in pool._units:
+            self._pool_map[unit] = pool
+        logger.info(f"AgentDirector: registered pool '{pool.pool_id}' ({len(pool._units)} units)")
         return self
 
     async def start(self) -> None:

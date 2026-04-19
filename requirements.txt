@@ -12,3 +12,7 @@ matplotlib>=3.8.0
 # For testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+
+# Web server
+fastapi>=0.100.0
+uvicorn>=0.23.0

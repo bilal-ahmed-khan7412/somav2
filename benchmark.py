@@ -74,7 +74,7 @@ EVENT_TEMPLATES: List[Tuple[str, Dict]] = [
 ]
 
 
-def make_events(n: int) -> List[Tuple[str, Dict, str]]:
+def make_events(n: int, stress: bool = False) -> List[Tuple[str, Dict, str]]:
     events = []
     for i in range(n):
         # Repeat tasks from 10 steps ago for cache testing
@@ -85,12 +85,17 @@ def make_events(n: int) -> List[Tuple[str, Dict, str]]:
             
         idx = effective_i % len(EVENT_TEMPLATES)
         tmpl, ctx = EVENT_TEMPLATES[idx]
+        ctx = dict(ctx)
+        
+        if stress:
+            ctx["urgency"] = "high"
+            ctx["contested"] = True
         
         if idx < 2: depth = "simple"
         elif idx < 4: depth = "medium"
         else: depth = "complex"
         
-        events.append((tmpl.format(i=effective_i), dict(ctx), depth))
+        events.append((tmpl.format(i=effective_i), ctx, depth))
     return events
 
 
@@ -153,11 +158,11 @@ async def run_baseline(events: List[Tuple[str, Dict, str]], sim_latency: bool) -
 
 # ── V2 benchmark ──────────────────────────────────────────────────────────────
 
-async def run_v2(events: List[Tuple[str, Dict, str]], sim_latency: bool, concurrency: int) -> Dict[str, Any]:
+async def run_v2(events: List[Tuple[str, Dict, str]], sim_latency: bool, concurrency: int, seed: int = 42) -> Dict[str, Any]:
     call_log: List[str] = []
     llm = make_llm(sim_latency, call_log)
     mem = HierarchicalMemory(cold_enabled=False)
-    random.seed(42)
+    random.seed(seed)
 
     director = AgentDirector(llm_callback=llm, memory=mem)
     for i in range(concurrency):
@@ -190,6 +195,9 @@ async def run_v2(events: List[Tuple[str, Dict, str]], sim_latency: bool, concurr
             # V2 success roll (actual depth from classifier)
             if random.random() < PROB_SUCCESS.get(depth, (0.7, 0.85))[1]:
                 successes += 1
+            else:
+                event_text = batch[idx][0]
+                logger.warning(f"Task Failed (Simulated): '{event_text}' [Depth={depth}]")
 
     total_ms = (time.perf_counter() - t0) * 1000
     await director.stop()
@@ -251,10 +259,14 @@ def print_report(baseline: Dict, v2: Dict) -> None:
     print("=" * 62 + "\n")
 
     # Interpretation
-    simple = v2["depth_dist"].get("simple", 0)
+    hybrid = v2["agent_dist"].get("hybrid_router", 0)
     total  = v2["tasks"]
     print("  Interpretation")
-    print(f"  - {simple}/{total} tasks ({simple/total*100:.0f}%) took the reactive (zero-LLM) fast path")
+    if hybrid > 0:
+        print(f"  - {hybrid}/{total} tasks ({hybrid/total*100:.0f}%) took the Hybrid Router fast path (zero ML inference)")
+    else:
+        print(f"  - 0/{total} tasks took the fast path (Hybrid Router correctly disengaged for high-urgency/contention)")
+    
     print(f"  - V2 used {v2['llm_per_task']:.2f} LLM calls/task vs {baseline['llm_per_task']:.2f} baseline")
     print(f"  - Baseline Success: {baseline['success_rate']}% (Low for complex tasks)")
     print(f"  - V2 Success:       {v2['success_rate']}% (+{v2['success_rate'] - baseline['success_rate']:.1f}% gain)")
@@ -266,15 +278,15 @@ def print_report(baseline: Dict, v2: Dict) -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-async def main(n_tasks: int, sim_latency: bool, concurrency: int) -> None:
-    events = make_events(n_tasks)
-    print(f"Running benchmark: {n_tasks} tasks, concurrency={concurrency}, sim_latency={sim_latency}")
+async def main(n_tasks: int, sim_latency: bool, concurrency: int, seed: int = 42, stress: bool = False) -> None:
+    events = make_events(n_tasks, stress=stress)
+    print(f"Running benchmark: {n_tasks} tasks, concurrency={concurrency}, sim_latency={sim_latency}, seed={seed}, stress={stress}")
 
     print("  [1/2] Baseline (flat LLM)...")
     baseline = await run_baseline(events, sim_latency)
 
     print("  [2/2] V2 (heterogeneous dispatch)...")
-    v2 = await run_v2(events, sim_latency, concurrency)
+    v2 = await run_v2(events, sim_latency, concurrency, seed=seed)
 
     print_report(baseline, v2)
 
@@ -286,10 +298,16 @@ if __name__ == "__main__":
                         help="Number of parallel agent slots")
     parser.add_argument("--no-sim-latency", action="store_true",
                         help="Skip sleep-based latency simulation")
+    parser.add_argument("--seed",           type=int,  default=42,
+                        help="Random seed for success rolls")
+    parser.add_argument("--stress",         action="store_true",
+                        help="Force high urgency/contention to test Hybrid Router disengagement")
     args = parser.parse_args()
 
     asyncio.run(main(
         n_tasks=args.tasks,
         sim_latency=not args.no_sim_latency,
         concurrency=args.concurrency,
+        seed=args.seed,
+        stress=args.stress,
     ))
