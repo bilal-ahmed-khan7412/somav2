@@ -1,59 +1,30 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "soma-v2"
 version = "2.0.0"
-description = "SOMA V2 — Memory-augmented, negotiation-aware OS for autonomous drone swarms"
-readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.10"
-
+description = "A Heterogeneous Multi-Agent Kernel with Semantic Plan Memoization"
 authors = [
-    { name = "SOMA V2 Research Team" }
+    { name = "Urban Swarm Research Group", email = "research@urban-swarm.io" }
 ]
-
-keywords = [
-    "multi-agent systems", "swarm robotics", "LLM agents",
-    "semantic caching", "autonomous drones", "agentic OS"
-]
-
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
-
+readme = "README.md"
+requires-python = ">=3.9"
 dependencies = [
-    "sentence-transformers>=2.7.0",
-    "chromadb>=0.5.0",
-    "scikit-learn>=1.4.0",
-    "aiohttp>=3.9.0",
-    "numpy>=1.26.0",
+    "httpx>=0.27.0",
+    "numpy>=1.24.0",
     "joblib>=1.3.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "matplotlib>=3.8.0",
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-]
-plots = [
-    "matplotlib>=3.8.0",
+    "scikit-learn>=1.3.0",
+    "chromadb>=0.4.0",
+    "sentence-transformers>=2.2.0",
+    "scipy>=1.10.0"
 ]
 
 [project.urls]
-Repository = "https://github.com/YOUR_USERNAME/urban-swarm-os-v2"
-Paper = "https://arxiv.org/abs/XXXX.XXXXX"
+Homepage = "https://github.com/urban-swarm-os/soma-v2"
+Documentation = "https://github.com/urban-swarm-os/soma-v2/wiki"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-dir]
-"" = "src"
+include = ["soma_v2*"]

@@ -19,16 +19,17 @@ from .depth_classifier import DepthClassifier, DEPTH_SIMPLE, DEPTH_MEDIUM, DEPTH
 from ..agents.reactive import ReactiveAgent
 from ..agents.routing import RoutingAgent
 from ..agents.deliberative import DeliberativeAgent
+from .tools import ToolRegistry
 
 logger = logging.getLogger("SOMA_V2.KERNEL")
 
 # ── LLM call wrapper: timeout + exponential-backoff retry ─────────────────────
 
-def _make_resilient_llm(llm_callback, timeout_s: float = 30.0, max_retries: int = 2, max_concurrent: int = 2):
+def _make_resilient_llm(llm_callback, telemetry=None, timeout_s: float = 15.0, max_retries: int = 2, max_concurrent: int = 2):
     """
     Wraps any llm_callback with:
       - concurrency semaphore (default 2) — prevents flooding a single Ollama instance
-      - per-call timeout (default 30s) — prevents a hung Ollama from freezing a wave
+      - per-call timeout (default 15s) — prevents a hung Ollama from freezing a wave
       - exponential backoff retry (1s, 2s) on timeout or exception
       - returns a fallback string on total failure so the plan step degrades gracefully
     """
@@ -41,23 +42,54 @@ def _make_resilient_llm(llm_callback, timeout_s: float = 30.0, max_retries: int 
         delay = 1.0
         last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(max_retries + 1):
+            t_start = time.perf_counter()
             try:
                 async with _sem:
-                    return await asyncio.wait_for(
+                    wait_ms = (time.perf_counter() - t_start) * 1000
+                    t_call = time.perf_counter()
+                    res = await asyncio.wait_for(
                         llm_callback(task_type, prompt),
                         timeout=timeout_s,
                     )
+                    call_ms = (time.perf_counter() - t_call) * 1000
+                    if telemetry:
+                        telemetry.log_event("llm_attempt", {
+                            "task_type": task_type,
+                            "attempt": attempt + 1,
+                            "status": "success",
+                            "wait_ms": round(wait_ms, 2),
+                            "call_ms": round(call_ms, 2),
+                            "latency_ms": round((time.perf_counter() - t_start) * 1000, 2)
+                        })
+                    return res
             except asyncio.TimeoutError:
                 last_exc = asyncio.TimeoutError(f"LLM timeout after {timeout_s}s")
+                latency_ms = (time.perf_counter() - t_start) * 1000
                 logger.warning(f"LLM call '{task_type}' timed out (attempt {attempt+1}/{max_retries+1})")
+                if telemetry:
+                    telemetry.log_event("llm_attempt", {
+                        "task_type": task_type,
+                        "attempt": attempt + 1,
+                        "status": "timeout",
+                        "latency_ms": round(latency_ms, 2)
+                    })
             except Exception as exc:
                 last_exc = exc
+                latency_ms = (time.perf_counter() - t_start) * 1000
                 logger.warning(f"LLM call '{task_type}' failed: {exc} (attempt {attempt+1}/{max_retries+1})")
+                if telemetry:
+                    telemetry.log_event("llm_attempt", {
+                        "task_type": task_type,
+                        "attempt": attempt + 1,
+                        "status": "error",
+                        "error": str(exc),
+                        "latency_ms": round(latency_ms, 2)
+                    })
             if attempt < max_retries:
                 await asyncio.sleep(delay)
                 delay *= 2
         logger.error(f"LLM call '{task_type}' exhausted retries — using fallback")
-        raise last_exc   # let caller handle (planner marks node FAILED, triggers backtrack)
+        raise last_exc
 
     return _call
 
@@ -86,7 +118,7 @@ class V2Kernel:
         model_path: str = "src/soma_v2/models/depth_classifier_v1.joblib",
         base_csv: str = "experiments/results/v8_training_data.csv",
         min_depth_confidence: float = 0.60,
-        llm_timeout_s: float = 30.0,
+        llm_timeout_s: float = 15.0,
         llm_max_retries: int = 2,
         llm_max_concurrent: int = 2,
         cold_threshold: float = 0.40,
@@ -95,14 +127,24 @@ class V2Kernel:
         blackboard=None,
         agent_id: Optional[str] = None,
         negotiation_broker=None,
+        tool_registry: Optional[ToolRegistry] = None,
+        telemetry: Optional[Any] = None,
         **kwargs,
     ):
-        self.llm_callback = llm_callback
-        self.memory       = memory
-        self.actuator     = actuator
-        self.agent_id     = agent_id or f"node_{uuid.uuid4().hex[:8]}"
+        self.llm_callback  = llm_callback
+        self.memory        = memory
+        self.actuator      = actuator
+        self.agent_id      = agent_id or f"node_{uuid.uuid4().hex[:8]}"
+        self.tool_registry = tool_registry
+        self.telemetry     = telemetry
 
-        _llm = _make_resilient_llm(llm_callback, timeout_s=llm_timeout_s, max_retries=llm_max_retries, max_concurrent=llm_max_concurrent)
+        _llm = _make_resilient_llm(
+            llm_callback, 
+            telemetry=self.telemetry,
+            timeout_s=llm_timeout_s, 
+            max_retries=llm_max_retries, 
+            max_concurrent=llm_max_concurrent
+        )
 
         self.classifier = DepthClassifier(
             model_path=model_path,
@@ -117,12 +159,22 @@ class V2Kernel:
             actuator=actuator, delegate_fn=delegate_fn,
             blackboard=blackboard, agent_id=self.agent_id,
             negotiation_broker=negotiation_broker,
+            tool_registry=tool_registry,
+            telemetry=self.telemetry,
             **kwargs,
         )
 
         self._dispatch_log: List[Dict[str, Any]] = []
 
         logger.info(f"V2Kernel initialised (llm_timeout={llm_timeout_s}s retries={llm_max_retries})")
+
+    def get_suspended_node(self) -> Optional[Any]:
+        """Returns the node suspended for HITL approval."""
+        return self.deliberative.get_suspended_node()
+
+    def approve(self):
+        """Resumes the suspended deliberative plan."""
+        self.deliberative.approve()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -135,12 +187,18 @@ class V2Kernel:
         contested: bool = False,
         reroute_attempts: int = 0,
         forced_depth: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Classify and dispatch a single event. Returns a result dict with
         depth, agent_type, decision, and latency_ms.
         """
         t0 = time.perf_counter()
+        from .telemetry import TaskTracer
+        tracer = None
+        if self.telemetry:
+            tracer = TaskTracer(self.telemetry, task_id or f"local_{uuid.uuid4().hex[:6]}")
+            tracer.record("task_start", event=event, agent_id=self.agent_id, urgency=urgency)
 
         # V2 Hybrid Router (Option 3): Fast-path rule routing
         # Skips ML inference entirely for uncontested routine tasks.
@@ -160,37 +218,46 @@ class V2Kernel:
             agent_type = None  # determined below
         
         logger.info(f"V2Kernel: depth={depth} p={depth_prob:.3f} event='{event[:60]}'")
+        if tracer:
+            tracer.record("kernel_dispatch", depth=depth, depth_prob=depth_prob)
 
-        if depth == DEPTH_SIMPLE:
-            result = await self.reactive.handle(event, agent_role, confidence, urgency)
-            if not agent_type: agent_type = "reactive"
-        elif depth == DEPTH_COMPLEX:
-            result = await self.deliberative.handle(event, agent_role, confidence, urgency)
-            agent_type = "deliberative"
-        else:
-            result = await self.routing.handle(event, agent_role, confidence, urgency)
-            agent_type = "routing"
+        try:
+            if depth == DEPTH_SIMPLE:
+                result = await self.reactive.handle(event, agent_role, confidence, urgency)
+                if not agent_type: agent_type = "reactive"
+            elif depth == DEPTH_COMPLEX:
+                result = await self.deliberative.handle(event, agent_role, confidence, urgency, task_id=task_id)
+                agent_type = "deliberative"
+            else:
+                result = await self.routing.handle(event, agent_role, confidence, urgency)
+                agent_type = "routing"
 
-        latency_ms = (time.perf_counter() - t0) * 1000
+            latency_ms = (time.perf_counter() - t0) * 1000
 
-        # Feed outcome back to classifier for online retraining.
-        # Skip if depth was forced — synthetic labels would corrupt the classifier.
-        if not forced_depth:
-            self.classifier.record_outcome(
-                agent_role, confidence, urgency, contested, reroute_attempts, depth,
-                event_text=event,
-            )
+            # Feed outcome back to classifier for online retraining.
+            if not forced_depth:
+                self.classifier.record_outcome(
+                    agent_role, confidence, urgency, contested, reroute_attempts, depth,
+                    event_text=event,
+                )
 
-        record = {
-            "event":       event[:80],
-            "depth":       depth,
-            "depth_prob":  round(depth_prob, 4),
-            "agent_type":  agent_type,
-            "decision":    result,
-            "latency_ms":  round(latency_ms, 2),
-        }
-        self._dispatch_log.append(record)
-        return record
+            record = {
+                "event":       event[:80],
+                "depth":       depth,
+                "depth_prob":  round(depth_prob, 4),
+                "agent_type":  agent_type,
+                "decision":    result,
+                "latency_ms":  round(latency_ms, 2),
+            }
+            self._dispatch_log.append(record)
+            if tracer:
+                tracer.end("success", depth=depth, latency_ms=latency_ms)
+            return record
+        except Exception as exc:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            if tracer:
+                tracer.end("failed", error=str(exc), latency_ms=latency_ms)
+            raise exc
 
     async def handle_batch(
         self,

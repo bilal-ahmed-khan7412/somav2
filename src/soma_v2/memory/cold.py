@@ -96,12 +96,39 @@ class _FlatStore:
     don't get unfairly penalised against long stored texts.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, persist_dir: Optional[str] = None) -> None:
         self._episodes: List[Dict] = []
+        self._file_path = None
+        if persist_dir:
+            import os
+            os.makedirs(persist_dir, exist_ok=True)
+            self._file_path = os.path.join(persist_dir, "flat_memory.jsonl")
+            self._load()
+
+    def _load(self) -> None:
+        import os, json
+        if not os.path.exists(self._file_path):
+            return
+        try:
+            with open(self._file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        self._episodes.append(json.loads(line))
+            logger.info(f"ColdMemory: loaded {len(self._episodes)} episodes from {self._file_path}")
+        except Exception as exc:
+            logger.warning(f"ColdMemory: failed to load flat memory: {exc}")
 
     def add(self, episode_id: str, text: str, metadata: Dict) -> None:
         norm = _norm(text)
-        self._episodes.append({"id": episode_id, "text": text, "norm": norm, "meta": metadata})
+        entry = {"id": episode_id, "text": text, "norm": norm, "meta": metadata}
+        self._episodes.append(entry)
+        if self._file_path:
+            import json
+            try:
+                with open(self._file_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+            except Exception as exc:
+                logger.warning(f"ColdMemory: failed to save flat memory: {exc}")
 
     def query(self, query_text: str, n: int) -> List[Dict]:
         q_tokens = set(_norm(query_text).split())
@@ -173,10 +200,10 @@ class ColdMemory:
                 logger.warning(f"ColdMemory: ChromaDB unavailable ({exc}), using flat fallback")
                 self._chroma     = None
                 self._collection = None
-                self._fallback   = _FlatStore()
+                self._fallback   = _FlatStore(persist_dir=persist_dir)
         else:
             logger.info("ColdMemory: chromadb not installed — using flat fallback")
-            self._fallback = _FlatStore()
+            self._fallback = _FlatStore(persist_dir=persist_dir)
 
     # ── write ─────────────────────────────────────────────────────────────────
 

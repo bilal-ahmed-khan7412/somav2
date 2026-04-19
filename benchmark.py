@@ -199,6 +199,12 @@ async def run_v2(events: List[Tuple[str, Dict, str]], sim_latency: bool, concurr
                 event_text = batch[idx][0]
                 logger.warning(f"Task Failed (Simulated): '{event_text}' [Depth={depth}]")
 
+    # Collect per-agent cache logs
+    full_cache_log = []
+    for sid, slot in director._slots.items():
+        full_cache_log.extend(slot.kernel.deliberative._cache_log)
+
+    stats = director.stats
     total_ms = (time.perf_counter() - t0) * 1000
     await director.stop()
 
@@ -215,7 +221,10 @@ async def run_v2(events: List[Tuple[str, Dict, str]], sim_latency: bool, concurr
         "success_rate": round(successes / len(events) * 100, 1),
         "depth_dist":   dict(depth_counts),
         "agent_dist":   dict(agent_counts),
-        "memory":       director.stats["memory"],
+        "memory":       stats["memory"],
+        "slot_loads":   stats["slot_loads"],
+        "negotiation":  stats["negotiation"],
+        "cache_log":    full_cache_log,
     }
 
 
@@ -253,6 +262,32 @@ def print_report(baseline: Dict, v2: Dict) -> None:
     print("-" * 62)
     print(f"  V2 depth distribution : {v2['depth_dist']}")
     print(f"  V2 agent distribution : {v2.get('agent_dist', {})}")
+    
+    # ── New Observability Metrics ─────────────────────────────────────────────
+    print("-" * 62)
+    print("  DETAILED SOMA V2 OBSERVABILITY")
+    print("-" * 62)
+    
+    # Slot Loads
+    loads = v2.get("slot_loads", {})
+    load_str = ", ".join([f"{sid}:{l}" for sid, l in loads.items()])
+    print(f"  Per-Agent Loads      : {load_str}")
+    
+    # Negotiation
+    neg = v2.get("negotiation", {})
+    print(f"  Negotiation Success  : {neg.get('success_rate', 0)*100:.0f}% ({neg.get('total_attempts', 0)} attempts)")
+    
+    # Cache Breakdown
+    cache_log = v2.get("cache_log", [])
+    if cache_log:
+        l1_hits = sum(1 for entry in cache_log if entry.get("level") == "L1-hot")
+        l2_hits = sum(1 for entry in cache_log if entry.get("level") == "L2-cold")
+        misses  = sum(1 for entry in cache_log if not entry.get("hit"))
+        total   = len(cache_log)
+        print(f"  Cache Performance    : L1={l1_hits}, L2={l2_hits}, Miss={misses} (Total={total})")
+        if total > 0:
+            print(f"  Cache Hit Rate       : {(l1_hits + l2_hits) / total * 100:.1f}%")
+
     cold = v2["memory"]["cold"]
     if "episode_count" in cold:
         print(f"  V2 cold episodes stored: {cold['episode_count']}")

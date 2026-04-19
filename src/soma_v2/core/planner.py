@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 from typing import Any, Callable, Coroutine, Dict, List, Optional
+from .tools import ToolRegistry
 
 _DELEGATE_RE = re.compile(r'\[DELEGATE\]\s*(.+)', re.IGNORECASE)
 _CMD_UNIT_RE = re.compile(r'\[CMD\]\s+\w+\s+([A-Z]\d+)', re.IGNORECASE)  # [CMD] VERB UNIT
@@ -43,6 +44,7 @@ logger = logging.getLogger("SOMA_V2.PLANNER")
 class NodeStatus(str, Enum):
     PENDING   = "pending"
     RUNNING   = "running"
+    SUSPENDED = "suspended"   # Waiting for human approval
     DONE      = "done"
     FAILED    = "failed"
     SKIPPED   = "skipped"
@@ -58,16 +60,25 @@ class PlanNode:
 
     Parameters
     ----------
-    node_id     : unique identifier within the graph
-    description : human-readable step description (sent to LLM as prompt)
-    deps        : list of node_ids that must be DONE before this node runs
-    alternative : node_id to try if this node FAILs (optional backtrack)
+    node_id : str
+        Unique ID for this node (e.g. s1, s2).
+    description : str
+        Natural language description of the step.
+    deps : List[str]
+        IDs of nodes that must complete before this one starts.
+    alternative : Optional[str]
+        ID of a node to attempt if this one fails.
+    command : Optional[str]
+        Explicit structured command or tool name.
+    interrupt : bool
+        If True, the executor pauses before running this node.
     """
     node_id:     str
     description: str
-    deps:        List[str]       = field(default_factory=list)
-    alternative: Optional[str]  = None
-    command:     Optional[str]  = None   # Structured command (e.g. "GOTO A12 SECTOR")
+    deps:        List[str] = field(default_factory=list)
+    alternative: Optional[str] = None
+    command:     Optional[str] = None
+    interrupt:   bool = False
 
     # runtime state — set by Executor
     status:     NodeStatus      = field(default=NodeStatus.PENDING, init=False)
@@ -168,6 +179,9 @@ class PlanExecutor:
         claim_timeout_s: float = 2.0,
         delegate_timeout_s: float = 10.0,
         resource_pools: Optional[Dict[str, Any]] = None,
+        tool_registry: Optional[ToolRegistry] = None,
+        telemetry: Optional[Any] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         self.llm_callback       = llm_callback
         self.task_type          = task_type
@@ -179,6 +193,11 @@ class PlanExecutor:
         self.claim_timeout_s    = claim_timeout_s
         self.delegate_timeout_s = delegate_timeout_s
         self.resource_pools     = resource_pools or {}
+        self.tool_registry      = tool_registry
+        self.telemetry          = telemetry
+        self.task_id            = task_id
+        self.approval_event     = asyncio.Event()
+        self.suspended_node: Optional[PlanNode] = None
         self._negotiated_load   = 0   # count of negotiated steps currently executing
 
         # Self-register with broker so other agents can propose steps to us
@@ -199,6 +218,15 @@ class PlanExecutor:
             self._negotiated_load = max(0, self._negotiated_load - 1)
 
     async def _run_node(self, node: PlanNode, context: str) -> None:
+        if node.interrupt:
+            logger.info(f"PlanNode '{node.node_id}': SUSPENDED (waiting for human approval)")
+            node.status = NodeStatus.SUSPENDED
+            self.suspended_node = node
+            self.approval_event.clear()
+            await self.approval_event.wait()
+            self.suspended_node = None
+            logger.info(f"PlanNode '{node.node_id}': RESUMED after approval")
+
         node.status = NodeStatus.RUNNING
         t0 = time.perf_counter()
         try:
@@ -225,7 +253,7 @@ class PlanExecutor:
             else:
                 node.output = f"[stub] completed: {node.description}"
 
-            # ── Actuation Bridge: [CMD] or structured command ──────────────
+            # ── Actuation Bridge: Tools, [CMD], or structured command ──────────
             if self.actuator:
                 cmd_part = None
                 if node.command:
@@ -235,6 +263,29 @@ class PlanExecutor:
                     cmd_part = cmd_part.split("[DELEGATE]")[0].strip()
 
                 if cmd_part:
+                    # 1. Check if it's a registered tool
+                    if self.tool_registry:
+                        tool = self.tool_registry.get(cmd_part)
+                        if tool:
+                            logger.info(f"PlanExecutor: executing tool '{tool.name}' for node {node.node_id}")
+                            if self.telemetry:
+                                self.telemetry.log_event("tool_call", {
+                                    "task_id": self.task_id,
+                                    "agent_id": self.agent_id,
+                                    "node_id": node.node_id,
+                                    "tool": tool.name,
+                                    "cmd": cmd_part
+                                })
+                            try:
+                                tool_result = await tool.func()
+                                node.output = (node.output or "") + f" | [TOOL_RESULT: {tool_result}]"
+                                node.status = NodeStatus.DONE
+                                return
+                            except Exception as tool_exc:
+                                logger.error(f"Tool '{tool.name}' failed: {tool_exc}")
+                                raise
+
+                    # 2. Standard Actuator logic (Blackboard + [CMD])
                     # Claim the unit on the shared blackboard before actuating
                     unit_match  = _CMD_UNIT_RE.search(node.description)
                     unit_id     = unit_match.group(1) if unit_match else None
@@ -302,7 +353,7 @@ class PlanExecutor:
         finally:
             node.latency_ms = (time.perf_counter() - t0) * 1000
 
-    async def execute(self, graph: PlanGraph, context: str) -> PlanResult:
+    async def execute(self, graph: PlanGraph, context: str, task_id: Optional[str] = None) -> PlanResult:
         """Run all nodes in topological wave order with backtrack on failure."""
         t_total = time.perf_counter()
         backtracks_used: set = set()

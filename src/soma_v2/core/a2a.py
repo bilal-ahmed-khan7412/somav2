@@ -65,10 +65,11 @@ class A2ABus:
     Agents register a queue; the bus delivers by agent_id or broadcast ("*").
     """
 
-    def __init__(self) -> None:
+    def __init__(self, telemetry: Optional[Any] = None) -> None:
         self._queues:   Dict[str, asyncio.Queue] = {}
         self._handlers: Dict[str, Callable]      = {}
         self._history:  List[A2AMessage]         = []
+        self._telemetry = telemetry
 
     def register(self, agent_id: str) -> asyncio.Queue:
         q = asyncio.Queue()
@@ -82,6 +83,15 @@ class A2ABus:
     async def send(self, msg: A2AMessage) -> None:
         self._history.append(msg)
         logger.debug(f"A2ABus: {msg.sender} -> {msg.recipient} [{msg.msg_type}] task={msg.task_id}")
+
+        if self._telemetry:
+            self._telemetry.log_event("a2a_msg", {
+                "msg_type": msg.msg_type,
+                "sender": msg.sender,
+                "recipient": msg.recipient,
+                "msg_task_id": msg.task_id, # call it msg_task_id to avoid confusion with the tracing task_id
+                **msg.payload
+            })
 
         if msg.recipient == "*":
             for q in self._queues.values():

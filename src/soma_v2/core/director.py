@@ -58,6 +58,7 @@ class AgentSlot:
     kernel:     Optional[V2Kernel] = field(default=None, repr=False)
 
     memory:     Optional[HierarchicalMemory] = field(default=None, repr=False)
+    telemetry:  Optional[Any] = field(default=None, repr=False)
 
     _load:      int               = field(default=0,    init=False, repr=False)
     _bus:       Optional[A2ABus]  = field(default=None, init=False, repr=False)
@@ -180,12 +181,22 @@ class AgentDirector:
     await director.stop()
     """
 
-    def __init__(self, llm_callback=None, memory: Optional[HierarchicalMemory] = None, actuator: Optional[Any] = None, **kernel_kwargs) -> None:
+    def __init__(
+        self, 
+        llm_callback=None, 
+        memory: Optional[HierarchicalMemory] = None, 
+        actuator: Optional[Any] = None, 
+        tool_registry: Optional[ToolRegistry] = None,
+        telemetry: Optional[Any] = None,
+        **kernel_kwargs
+    ) -> None:
         self.llm_callback   = llm_callback
         self.actuator       = actuator
+        self.tool_registry  = tool_registry
+        self.telemetry      = telemetry
         self._kernel_kwargs = kernel_kwargs
         self._memory        = memory or HierarchicalMemory()
-        self._bus:        A2ABus             = A2ABus()
+        self._bus:        A2ABus             = A2ABus(telemetry=self.telemetry)
         self._blackboard: ResourceBlackboard = ResourceBlackboard(bus=self._bus)
         self._negotiator: NegotiationBroker  = NegotiationBroker(blackboard=self._blackboard, bus=self._bus)
         self._slots: Dict[str, AgentSlot] = {}
@@ -213,9 +224,11 @@ class AgentDirector:
             blackboard=self._blackboard, agent_id=slot_id,
             negotiation_broker=self._negotiator,
             resource_pools=self._pool_map,
+            tool_registry=self.tool_registry,
+            telemetry=self.telemetry,
             **self._kernel_kwargs,
         )
-        slot   = AgentSlot(slot_id=slot_id, role=role, capacity=capacity, kernel=kernel, memory=self._memory)
+        slot   = AgentSlot(slot_id=slot_id, role=role, capacity=capacity, kernel=kernel, memory=self._memory, telemetry=self.telemetry)
         slot.attach(self._bus)
         self._slots[slot_id] = slot
         logger.info(f"AgentDirector: added slot '{slot_id}' role={role}")
@@ -304,6 +317,16 @@ class AgentDirector:
         slot = self._slots[winner_id]
         logger.info(f"AgentDirector: task {task_id} -> '{winner_id}' load={slot.load} (hop={_hop})")
 
+        if self.telemetry:
+            self.telemetry.log_event("task_assigned", {
+                "task_id": task_id,
+                "winner_id": winner_id,
+                "winner_role": slot.role,
+                "winner_load": slot.load,
+                "hop": _hop,
+                "event": event[:100]
+            })
+
         # Execute directly on the slot — no queue hops for normal path
         self._stats["tasks_assigned"] += 1
         slot._load += 1
@@ -320,6 +343,7 @@ class AgentDirector:
                 contested=contested,
                 reroute_attempts=reroute_attempts,
                 forced_depth=forced_depth,
+                task_id=task_id,
             )
             success = True
             outcome = {"status": "success", "result": result}
@@ -356,3 +380,20 @@ class AgentDirector:
     @property
     def pool_size(self) -> int:
         return len(self._slots)
+
+    def get_suspended_tasks(self) -> Dict[str, str]:
+        """Returns a map of agent_id -> suspended_node_description."""
+        suspended = {}
+        for sid, slot in self._slots.items():
+            node = slot.kernel.get_suspended_node()
+            if node:
+                suspended[sid] = node.description
+        return suspended
+
+    def approve_task(self, agent_id: str):
+        """Resumes a specific agent's plan."""
+        if agent_id in self._slots:
+            self._slots[agent_id].kernel.approve()
+            logger.info(f"AgentDirector: Approved task on agent '{agent_id}'")
+        else:
+            logger.warning(f"AgentDirector: Cannot approve unknown agent '{agent_id}'")

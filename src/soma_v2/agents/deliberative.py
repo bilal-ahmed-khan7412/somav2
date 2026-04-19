@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from ..core.planner import PlanGraph, PlanNode, PlanExecutor
+from ..core.tools import ToolRegistry
 
 logger = logging.getLogger("SOMA_V2.DELIBERATIVE")
 
@@ -54,26 +55,37 @@ You are a deliberative planning agent. Given the task below and relevant histori
 Task: {event}
 Role: {role}, Urgency: {urgency}
 
+Available Tools:
+{tools}
+
 Memory (Relevant Historical Cases):
 {memory}
 
 Return ONLY valid JSON in this exact schema — no markdown, no extra text:
-{
+{{
   "steps": [
-    {"id": "s1", "description": "...", "deps": [], "command": "TAKEOFF A12", "alternative": null},
-    {"id": "s2", "description": "...", "deps": ["s1"], "command": "GOTO A12 BASE", "alternative": null}
+    {{
+      "id": "s1", 
+      "description": "...", 
+      "deps": [], 
+      "command": "TOOL_NAME_OR_CMD", 
+      "interrupt": false, 
+      "alternative": null
+    }}
   ]
-}
+}}
 
 Rules:
 - 3 to 5 steps maximum.
 - deps must reference earlier step ids only.
-- alternative is either null or a string id for a fallback step (not in the main list).
+- alternative is either null or a string id for a fallback step.
 - Descriptions must be concrete and actionable.
-- If memory shows FAILED cases, add an extra verification step or alternative path.
-- If memory shows SUCCESS cases with fewer steps, prefer the simpler plan.
-- CRITICAL: If the step requires physical movement or drone action, you MUST populate the "command" field with a string like: "TAKEOFF <unit>", "GOTO <unit> <target>", or "LAND <unit>". Use the exact unit ID (e.g. A12) from the task.
-- If the step requires a separate agent to handle a sub-task concurrently, you MUST append "[DELEGATE] <sub-task description>" to the "description" field.
+- RISK ASSESSMENT: You MUST set "interrupt": true for any step that is HIGH RISK.
+- HIGH RISK examples: Irreversible physical changes (DEPLOY, WIPE, PURGE), actions in civilian areas, or high-priority resource allocation.
+- LOW/MEDIUM RISK: Observation, navigation, status checks, or internal coordination.
+- If a tool from the "Available Tools" list matches the step, you MUST put the tool name in the "command" field.
+- If the tool has [RISK: HIGH], you MUST set "interrupt": true.
+- If the step requires a separate agent, append "[DELEGATE] <sub-task>" to the "description".
 """
 
 _FALLBACK_STEPS = [
@@ -133,6 +145,24 @@ def _inject_commands(graph: PlanGraph, event: str) -> PlanGraph:
     return graph
 
 
+def _apply_safety_rails(graph: PlanGraph, tool_registry: Optional[Any]) -> PlanGraph:
+    """
+    Force interrupt=True if a step uses a tool marked as HIGH risk, 
+    regardless of what the LLM decided.
+    """
+    if not tool_registry:
+        return graph
+
+    for node in graph.all_nodes():
+        if node.command:
+            tool = tool_registry.get(node.command)
+            if tool and hasattr(tool, 'risk') and tool.risk == "HIGH":
+                if not node.interrupt:
+                    logger.warning(f"Safety Rail: Forcing interrupt on HIGH risk tool '{tool.name}'")
+                    node.interrupt = True
+    return graph
+
+
 def _steps_to_graph(steps: List[Dict]) -> PlanGraph:
     g = PlanGraph()
     for s in steps:
@@ -142,6 +172,7 @@ def _steps_to_graph(steps: List[Dict]) -> PlanGraph:
             deps=s.get("deps") or [],
             alternative=s.get("alternative"),
             command=s.get("command"),
+            interrupt=s.get("interrupt") or False,
         ))
     return g
 
@@ -157,7 +188,7 @@ def _graph_from_json(plan_json: str) -> Optional[PlanGraph]:
         return None
 
 
-async def _llm_plan(event: str, role: str, urgency: str, llm_callback, memory=None) -> PlanGraph:
+async def _llm_plan(event: str, role: str, urgency: str, llm_callback, memory=None, tools: str = "None") -> PlanGraph:
     mem_text = "No relevant memory found."
     if memory:
         try:
@@ -182,7 +213,7 @@ async def _llm_plan(event: str, role: str, urgency: str, llm_callback, memory=No
         except Exception as exc:
             logger.warning(f"DeliberativeAgent: memory recall failed: {exc}")
 
-    prompt = _PLAN_PROMPT.format(event=event[:300], role=role, urgency=urgency, memory=mem_text)
+    prompt = _PLAN_PROMPT.format(event=event[:300], role=role, urgency=urgency, memory=mem_text, tools=tools)
     try:
         raw = await llm_callback("deliberative_plan", prompt)
         # ── multi-strategy JSON extraction ───────────────────────────────────
@@ -215,6 +246,8 @@ class DeliberativeAgent:
         blackboard=None,
         agent_id: str = "unknown",
         negotiation_broker=None,
+        tool_registry: Optional[ToolRegistry] = None,
+        telemetry: Optional[Any] = None,
         **kwargs,
     ):
         self.llm_callback   = llm_callback
@@ -224,6 +257,8 @@ class DeliberativeAgent:
         self.delegate_fn    = delegate_fn
         self.blackboard     = blackboard
         self.agent_id       = agent_id
+        self.tool_registry  = tool_registry
+        self.telemetry      = telemetry
         self._executor      = PlanExecutor(
             llm_callback=llm_callback,
             task_type="deliberative",
@@ -232,9 +267,18 @@ class DeliberativeAgent:
             blackboard=blackboard,
             agent_id=agent_id,
             negotiation_broker=negotiation_broker,
-            **kwargs,
+            tool_registry=tool_registry,
+            telemetry=telemetry,
         )
         self._cache_log: List[Dict[str, Any]] = []
+
+    def get_suspended_node(self) -> Optional[Any]:
+        """Returns the PlanNode currently awaiting human approval, if any."""
+        return self._executor.suspended_node
+
+    def approve(self):
+        """Signals the executor to resume the suspended node."""
+        self._executor.approval_event.set()
 
     # ── cache helpers ─────────────────────────────────────────────────────────
 
@@ -298,6 +342,7 @@ class DeliberativeAgent:
         agent_role: str,
         confidence: float,
         urgency: str,
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         logger.info(f"DeliberativeAgent: planning for '{event[:60]}'")
 
@@ -326,17 +371,33 @@ class DeliberativeAgent:
             "timestamp": time.time()
         })
 
+        if self.telemetry:
+            self.telemetry.log_event("cache_query", {
+                "hit": cached_match,
+                "level": cache_level or "miss",
+                "event_text": event[:50]
+            })
+
         # ── L3: LLM plan generation ───────────────────────────────────────────
         if not graph:
             if self.llm_callback:
-                graph = await _llm_plan(event, agent_role, urgency, self.llm_callback, memory=self.memory)
+                tools_prompt = "None"
+                if self.tool_registry:
+                    tools_prompt = self.tool_registry.get_prompt()
+                
+                graph = await _llm_plan(
+                    event, agent_role, urgency, self.llm_callback, 
+                    memory=self.memory, 
+                    tools=tools_prompt
+                )
             else:
                 graph = _steps_to_graph(_FALLBACK_STEPS)
             # Inject [CMD] tokens deterministically — LLM output is unreliable for syntax
             graph = _inject_commands(graph, event)
+            graph = _apply_safety_rails(graph, self.tool_registry)
 
         # ── execution ─────────────────────────────────────────────────────────
-        result = await self._executor.execute(graph, context=event)
+        result = await self._executor.execute(graph, context=event, task_id=task_id)
 
         # ── cache invalidation on failure ──────────────────────────────────────
         # If we reused a cached plan and it failed, evict it so future tasks
