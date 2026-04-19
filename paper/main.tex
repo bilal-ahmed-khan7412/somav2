@@ -7,6 +7,8 @@
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows, positioning, fit, backgrounds, calc}
 
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
@@ -82,6 +84,45 @@ The primary contributions of this paper are:
 % ── Section 2 ────────────────────────────────────────────────────────────────
 
 \section{Architecture}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[node distance=1.5cm, auto,
+    block/.style={rectangle, draw, fill=blue!10, text width=6em, text centered, rounded corners, minimum height=3em},
+    decision/.style={diamond, draw, fill=yellow!10, text width=4.5em, text badly centered, inner sep=0pt},
+    cloud/.style={draw, ellipse, fill=red!10, node distance=2.5cm, minimum height=2em},
+    line/.style={draw, -latex'}]
+    
+    % Nodes
+    \node [block] (input) {Incoming Task};
+    \node [decision, below=0.8cm of input] (router) {Hybrid Router};
+    \node [block, right=1.5cm of router] (l1) {L1 Hash Cache};
+    \node [block, below=0.8cm of l1] (l2) {L2 Semantic Cache};
+    
+    \node [block, below=1.5cm of router] (agents) {Agent Tier (R/R/D)};
+    \node [block, below=0.8cm of agents] (broker) {Negotiation Broker};
+    \node [block, below=0.8cm of broker] (output) {Actuator Output};
+
+    % Paths
+    \path [line] (input) -- (router);
+    \path [line] (router) -- node [near start] {check} (l1);
+    \path [line] (l1) -- node [near start] {miss} (l2);
+    \path [line] (l2) |- node [near start] {miss} (router);
+    \path [line] (l1) -- ++(2.5,0) |- node [near start, xshift=1cm] {hit} (agents);
+    \path [line] (l2) -- ++(2.5,0) |- node [near start, xshift=1cm] {hit} (agents);
+    \path [line] (router) -- node {dispatch} (agents);
+    \path [line] (agents) -- node {resolve} (broker);
+    \path [line] (broker) -- (output);
+    
+    % Background box
+    \begin{scope}[on background layer]
+        \node[fill=gray!5, draw=black!20, dashed, fit=(l1) (l2), label=above:{Memory Tier}] {};
+        \node[fill=gray!5, draw=black!20, dashed, fit=(router) (agents), label=left:{Logic Tier}] {};
+    \end{scope}
+\end{tikzpicture}
+\caption{The SOMA V2 Four-Tier Orchestration Architecture. Tasks pass through the Hybrid Router and are cross-referenced against L1/L2 caches before agent dispatch. Resource contention is resolved via the asynchronous Negotiation Broker.}
+\label{fig:arch}
+\end{figure}
 
 \subsection{Text-Aware Depth Classifier}
 
@@ -538,7 +579,7 @@ In stub-mode framework comparison, SOMA V2 achieves \textbf{51.7\%}
 fewer LLM calls per task through its Hybrid Router fast-path. This mechanism is
 conservative: under high-urgency or resource contention, the fast-path automatically
 disengages, routing tasks through the full classifier hierarchy to ensure reasoning
-reasoning integrity. In simulated full-scale LLM load, cold plan generation averages 20.07s; warm L1 cache
+integrity. In simulated full-scale LLM load, cold plan generation averages 20.07s; warm L1 cache
 hits serve the same plan in 0.61ms --- an empirical 32,823$\times$ reduction. The ResourceBlackboard provides a three-tier contention hierarchy: pool-based claiming
 eliminates conflicts entirely (0 vs.\ 52, +27\% throughput); when named claims are
 required, the NegotiationBroker resolves over 90\% of attempts via fire-and-forget peer

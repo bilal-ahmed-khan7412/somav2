@@ -46,7 +46,8 @@ class SOMASwarm:
             llm_callback=self.llm_callback, 
             memory=self.memory,
             tool_registry=self.tool_registry,
-            telemetry=self.telemetry
+            telemetry=self.telemetry,
+            bus=self.bus
         )
         
         # Initialise standard slots

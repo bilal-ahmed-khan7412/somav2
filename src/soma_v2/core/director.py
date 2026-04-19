@@ -188,6 +188,7 @@ class AgentDirector:
         actuator: Optional[Any] = None, 
         tool_registry: Optional[ToolRegistry] = None,
         telemetry: Optional[Any] = None,
+        bus: Optional[A2ABus] = None,
         **kernel_kwargs
     ) -> None:
         self.llm_callback   = llm_callback
@@ -196,7 +197,7 @@ class AgentDirector:
         self.telemetry      = telemetry
         self._kernel_kwargs = kernel_kwargs
         self._memory        = memory or HierarchicalMemory()
-        self._bus:        A2ABus             = A2ABus(telemetry=self.telemetry)
+        self._bus:        A2ABus             = bus or A2ABus(telemetry=self.telemetry)
         self._blackboard: ResourceBlackboard = ResourceBlackboard(bus=self._bus)
         self._negotiator: NegotiationBroker  = NegotiationBroker(blackboard=self._blackboard, bus=self._bus)
         self._slots: Dict[str, AgentSlot] = {}
