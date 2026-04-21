@@ -189,6 +189,7 @@ class AgentDirector:
         tool_registry: Optional[ToolRegistry] = None,
         telemetry: Optional[Any] = None,
         bus: Optional[A2ABus] = None,
+        blackboard: Optional[ResourceBlackboard] = None,
         **kernel_kwargs
     ) -> None:
         self.llm_callback   = llm_callback
@@ -198,12 +199,12 @@ class AgentDirector:
         self._kernel_kwargs = kernel_kwargs
         self._memory        = memory or HierarchicalMemory()
         self._bus:        A2ABus             = bus or A2ABus(telemetry=self.telemetry)
-        self._blackboard: ResourceBlackboard = ResourceBlackboard(bus=self._bus)
+        self._blackboard: ResourceBlackboard = blackboard or ResourceBlackboard(bus=self._bus)
         self._negotiator: NegotiationBroker  = NegotiationBroker(blackboard=self._blackboard, bus=self._bus)
         self._slots: Dict[str, AgentSlot] = {}
         self._director_id = "director"
         self._dir_queue   = self._bus.register(self._director_id)
-        self._stats: Dict[str, int]   = {"tasks_assigned": 0, "tasks_delegated": 0, "tasks_failed": 0}
+        self._stats: Dict[str, int]   = {"tasks_assigned": 0, "tasks_delegated": 0, "tasks_failed": 0, "overflow_routes": 0}
         self._rr_counter: int         = 0
         self._pool_map: Dict[str, Any] = {}   # unit_id -> ResourcePool; shared by reference with all kernels
 
@@ -317,6 +318,12 @@ class AgentDirector:
         self._rr_counter += 1
         slot = self._slots[winner_id]
         logger.info(f"AgentDirector: task {task_id} -> '{winner_id}' load={slot.load} (hop={_hop})")
+
+        if _hop > 0:
+            self._stats["tasks_delegated"] += 1
+        # track tasks routed to a slot that already has work (cross-slot load sharing)
+        if slot._load > 0:
+            self._stats["overflow_routes"] += 1
 
         if self.telemetry:
             self.telemetry.log_event("task_assigned", {

@@ -1,4 +1,0 @@
-{"timestamp": 1776585871.218749, "event": "Deploy unit D105 to Sector 7, then SCAN the area and RTB.", "task_id": "5ca4ed656f", "winner_id": "agent_0", "hop": 0}
-{"timestamp": 1776585871.2197645, "event": "Deploy unit D105 to Sector 7, then SCAN the area and RTB.", "task_id": "5ca4ed656f", "agent_id": "agent_0", "urgency": "high"}
-{"timestamp": 1776585871.2208123, "event": "kernel_dispatch", "task_id": "5ca4ed656f", "depth": "complex", "depth_prob": 1.0}
-{"timestamp": 1776585871.2632763, "event": "task_end", "task_id": "5ca4ed656f", "status": "failed", "duration_s": 0.044, "error": "'\\n  \"steps\"'", "latency_ms": 43.293199998515774}

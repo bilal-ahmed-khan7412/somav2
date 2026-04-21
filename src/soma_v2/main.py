@@ -25,12 +25,14 @@ class SOMASwarm:
     """
     
     def __init__(
-        self, 
-        model: str = "ollama/qwen2.5:3b", 
+        self,
+        model: str = "ollama/qwen2.5:3b",
         slots: int = 3,
         hot_cache_cap: int = 128,
         persist_dir: str = "./soma_memory",
-        trace_dir: Optional[str] = "./soma_traces"
+        trace_dir: Optional[str] = "./soma_traces",
+        actuator: Optional[Any] = None,
+        **kernel_kwargs,
     ):
         from .core.telemetry import TelemetryStore
         self.bus = A2ABus()
@@ -41,15 +43,17 @@ class SOMASwarm:
         )
         self.tool_registry = ToolRegistry()
         self.llm_callback = get_llm_callback(model)
-        
+
         self.director = AgentDirector(
-            llm_callback=self.llm_callback, 
+            llm_callback=self.llm_callback,
             memory=self.memory,
+            actuator=actuator,
             tool_registry=self.tool_registry,
             telemetry=self.telemetry,
-            bus=self.bus
+            bus=self.bus,
+            **kernel_kwargs,
         )
-        
+
         # Initialise standard slots
         self._setup_default_slots(slots)
         
@@ -70,13 +74,13 @@ class SOMASwarm:
                 capacity=5
             )
 
-    async def dispatch(self, task: str, urgency: str = "medium") -> Dict[str, Any]:
+    async def dispatch(self, task: str, urgency: str = "medium", forced_depth: Optional[str] = None) -> Dict[str, Any]:
         """
         Dispatches a task to the swarm.
         Returns the final TASK_RESULT payload.
         """
         try:
-            result = await self.director.assign(task, urgency=urgency)
+            result = await self.director.assign(task, urgency=urgency, forced_depth=forced_depth)
             return result
         except Exception as e:
             logger.error(f"SOMASwarm: dispatch failed - {e}")

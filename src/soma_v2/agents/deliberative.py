@@ -50,7 +50,7 @@ def _plan_key(text: str) -> str:
 # ── LLM plan generation ──────────────────────────────────────────────────────
 
 _PLAN_PROMPT = """\
-You are a deliberative planning agent. Given the task below and relevant historical context from memory, output a JSON plan.
+You are a drone mission planner. Output a JSON plan for the task below.
 
 Task: {event}
 Role: {role}, Urgency: {urgency}
@@ -61,31 +61,36 @@ Available Tools:
 Memory (Relevant Historical Cases):
 {memory}
 
-Return ONLY valid JSON in this exact schema — no markdown, no extra text:
+Drone command syntax — embed EXACTLY one [CMD] token per step that moves a drone:
+  [CMD] TAKEOFF <unit>
+  [CMD] GOTO <unit> <x> <y> <z>
+  [CMD] SCAN <unit> <area>
+  [CMD] DEPLOY <unit> <payload>
+  [CMD] LAND <unit>
+  [CMD] STATUS <unit>
+
+Unit names: B1, B2 (map to Drone1, Drone2 in simulator).
+Coordinates are in metres (z negative = altitude above ground, e.g. -4).
+
+Return ONLY valid JSON — no markdown, no extra text:
 {{
   "steps": [
     {{
-      "id": "s1", 
-      "description": "...", 
-      "deps": [], 
-      "command": "TOOL_NAME_OR_CMD", 
-      "interrupt": false, 
+      "id": "s1",
+      "description": "Take off drone B1. [CMD] TAKEOFF B1",
+      "deps": [],
+      "interrupt": false,
       "alternative": null
     }}
   ]
 }}
 
 Rules:
-- 3 to 5 steps maximum.
-- deps must reference earlier step ids only.
-- alternative is either null or a string id for a fallback step.
-- Descriptions must be concrete and actionable.
-- RISK ASSESSMENT: You MUST set "interrupt": true for any step that is HIGH RISK.
-- HIGH RISK examples: Irreversible physical changes (DEPLOY, WIPE, PURGE), actions in civilian areas, or high-priority resource allocation.
-- LOW/MEDIUM RISK: Observation, navigation, status checks, or internal coordination.
-- If a tool from the "Available Tools" list matches the step, you MUST put the tool name in the "command" field.
-- If the tool has [RISK: HIGH], you MUST set "interrupt": true.
-- If the step requires a separate agent, append "[DELEGATE] <sub-task>" to the "description".
+- 3 to 6 steps.
+- deps lists IDs of steps that must complete first.
+- Every movement step MUST include a [CMD] token using the syntax above.
+- Set "interrupt": true only for DEPLOY steps (irreversible payload release).
+- alternative is null unless you name a fallback step id.
 """
 
 _FALLBACK_STEPS = [

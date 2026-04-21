@@ -86,7 +86,7 @@ class NegotiationBroker:
         t0 = time.perf_counter()
 
         # Find the agent that owns the unit right now
-        target_id = self._blackboard._owners.get(unit_id)
+        target_id = self._blackboard._locks.get(unit_id)
         if not target_id or target_id not in self._executors:
             self._rejected += 1
             logger.debug(

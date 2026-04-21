@@ -56,5 +56,17 @@ paper/*.bbl
 paper/*.blg
 paper/*.toc
 
+# Environment variables
+.env
+.env.*
+
+# Local Data and Caches
+soma_cache/
+soma_memory/
+soma_traces/
+sample_mission_data/
+test_soma_memory/
+test_telemetry_data/
+
 # Zip archives (regenerable)
 *.zip
