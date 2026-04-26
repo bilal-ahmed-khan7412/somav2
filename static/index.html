@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Project Sentinel | SOMA Multi-Agent Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- HEADER -->
+        <header class="top-bar">
+            <div class="logo">
+                <span class="pulse-dot"></span>
+                <h1>SOMA<span> Sentinel</span></h1>
+            </div>
+            <div class="controls">
+                <button id="start-btn" class="btn primary-btn">INITIATE SIMULATION</button>
+            </div>
+        </header>
+
+        <div class="main-grid">
+            <!-- LEFT PANEL: Server Map -->
+            <section class="panel servers-panel">
+                <h2>Cluster Topology</h2>
+                <div class="server-grid">
+                    <div class="server-card" id="PROXY_NODE">
+                        <div class="server-icon">🌐</div>
+                        <div class="server-name">Web Proxy</div>
+                        <div class="server-status">Healthy</div>
+                        <div class="lock-indicator" id="lock-PROXY_NODE"></div>
+                    </div>
+                    
+                    <div class="server-row">
+                        <div class="server-card" id="APP_NODE_1">
+                            <div class="server-icon">📦</div>
+                            <div class="server-name">App Server 1</div>
+                            <div class="server-status">Healthy</div>
+                            <div class="lock-indicator" id="lock-APP_NODE_1"></div>
+                        </div>
+                        <div class="server-card" id="APP_NODE_2">
+                            <div class="server-icon">📦</div>
+                            <div class="server-name">App Server 2</div>
+                            <div class="server-status">Healthy</div>
+                            <div class="lock-indicator" id="lock-APP_NODE_2"></div>
+                        </div>
+                    </div>
+
+                    <div class="server-row">
+                        <div class="server-card" id="DB_PRIMARY">
+                            <div class="server-icon">🗄️</div>
+                            <div class="server-name">DB Primary</div>
+                            <div class="server-status">Healthy</div>
+                            <div class="lock-indicator" id="lock-DB_PRIMARY"></div>
+                        </div>
+                        <div class="server-card" id="DB_REPLICA">
+                            <div class="server-icon">🗃️</div>
+                            <div class="server-name">DB Replica</div>
+                            <div class="server-status">Healthy</div>
+                            <div class="lock-indicator" id="lock-DB_REPLICA"></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- MIDDLE PANEL: Agents -->
+            <section class="panel agents-panel">
+                <h2>Active Agents</h2>
+                <div class="agent-list">
+                    <div class="agent-card" id="agent_0">
+                        <div class="agent-header">
+                            <span class="role COMMAND">SECOPS (COMMAND)</span>
+                            <span class="load-badge">Idle</span>
+                        </div>
+                        <div class="agent-task">Awaiting dispatch...</div>
+                    </div>
+                    <div class="agent-card" id="agent_1">
+                        <div class="agent-header">
+                            <span class="role FIELD">NETOPS (FIELD)</span>
+                            <span class="load-badge">Idle</span>
+                        </div>
+                        <div class="agent-task">Awaiting dispatch...</div>
+                    </div>
+                    <div class="agent-card" id="agent_2">
+                        <div class="agent-header">
+                            <span class="role SUPPORT">SYSADMIN (SUPPORT)</span>
+                            <span class="load-badge">Idle</span>
+                        </div>
+                        <div class="agent-task">Awaiting dispatch...</div>
+                    </div>
+                </div>
+                
+                <h2 style="margin-top: 2rem;">A2A Bus Negotiation</h2>
+                <div class="negotiation-feed" id="negotiation-feed">
+                    <div class="log-hint">Awaiting inter-agent proposals...</div>
+                </div>
+            </section>
+
+            <!-- RIGHT PANEL: Terminal Log -->
+            <section class="panel terminal-panel">
+                <h2>Global Telemetry</h2>
+                <div class="terminal-content" id="terminal-content">
+                    <div class="log-line">System armed and ready.</div>
+                </div>
+            </section>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>

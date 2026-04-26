@@ -1,77 +1,191 @@
-# SOMA V2: The Urban Swarm OS Kernel 🐝
+# SOMA V2
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version: 2.0.0](https://img.shields.io/badge/Version-2.0.0-blue.svg)]()
-[![Build: Research Prototype](https://img.shields.io/badge/Build-Research_Hardened-green.svg)]()
+**S**warm **O**rchestration **M**ulti-Agent **A**rchitecture — Version 2.
 
-**SOMA V2** is a high-performance, heterogeneous multi-agent kernel designed for physical swarm coordination. Unlike general-purpose frameworks (AutoGen, LangGraph) that trigger full LLM reasoning for every task, SOMA V2 uses **Depth Gating** and **Semantic Plan Memoization** to reduce "Intelligence Tax" by over 50%.
+A lightweight, production-ready multi-agent kernel with:
+- **Three-tier agent routing** (Reactive → Routing → Deliberative)
+- **DAG-based planning** with backtracking and plan memoization
+- **Hierarchical memory** (in-process LRU + ChromaDB episodic recall)
+- **OpenAI-native** via the official `openai` Python SDK (also supports Groq, DeepSeek, Ollama)
+- **FastAPI REST interface** for remote task dispatch
 
 ---
 
-## 🚀 One-Line Quickstart
+## Installation
+
+```bash
+pip install -e .
+```
+
+## Quick Start
 
 ```python
 import asyncio
 from soma_v2 import SOMASwarm
 
 async def main():
-    # Initialize a swarm with 3 agents using Ollama
-    swarm = SOMASwarm(model="ollama/qwen2.5:3b", slots=3)
-    
-    # Dispatch a task - SOMA automatically decides the reasoning depth
-    result = await swarm.dispatch("Routine heartbeat check node 0")
-    print(f"Decision: {result['decision']}")
-    
+    swarm = SOMASwarm(model="openai/gpt-4o-mini", slots=3)
+    result = await swarm.dispatch("Analyse our Q1 sales data and identify underperforming regions")
+    print(result)
     await swarm.close()
 
 asyncio.run(main())
 ```
 
----
-
-## 💎 Why SOMA V2?
-
-| Feature | AutoGen / LangGraph | **SOMA V2** |
-| :--- | :--- | :--- |
-| **Reasoning Tax** | High (LLM for every step) | **Low (Dynamic Depth Gating)** |
-| **Throughput** | Sequential / Limited | **Concurrent (89+ tasks/s)** |
-| **Memoization** | None / Simple Key-Value | **Hierarchical Semantic Caching** |
-| **Resource Contention** | Heuristic / Manual | **Autonomous Resource Blackboard** |
-| **Efficiency** | Baseline | **51.7% fewer LLM calls** |
-
----
-
-## 🛠 Architectural Pillars
-
-### 1. Hybrid Router (Depth Gating)
-A text-aware Random Forest classifier predicts the required reasoning depth (Reactive, Routing, or Deliberative) before any LLM is called. 
-- **Fast-Path**: Routine tasks (pings, status checks) skip ML inference entirely.
-- **Disengagement**: Automatically reverts to full reasoning for high-urgency events.
-
-### 2. Hierarchical Semantic Memory (L1/L2)
-SOMA V2 caches **plans**, not just text. 
-- **L1 Hot Cache**: Sub-millisecond plan retrieval for recurring missions.
-- **L2 Cold Cache**: ChromaDB-backed vector memory for historical episodic recall.
-
-### 3. Resource Blackboard & Negotiation
-A real-time, in-process A2A (Agent-to-Agent) bus allows agents to claim and release physical units (drones, sensors) with autonomous conflict resolution and delegation.
-
----
-
-## 📦 Installation
+Set your API key before running:
 
 ```bash
-git clone https://github.com/urban-swarm-os/soma-v2
-cd soma-v2
-pip install -e .
+export OPENAI_API_KEY="sk-..."
+python example_quickstart.py
 ```
 
 ---
 
-## 📜 Academic Reference
+## Supported Models
 
-If you use SOMA V2 in your research, please cite our latest manuscript:
-> "SOMA V2: A Heterogeneous Multi-Agent Kernel with Semantic Plan Memoization and Text-Aware Depth Gating" (USRG, 2026).
+| Model string | Provider | Env var required |
+|---|---|---|
+| `openai/gpt-4o-mini` | OpenAI | `OPENAI_API_KEY` |
+| `openai/gpt-4o` | OpenAI | `OPENAI_API_KEY` |
+| `groq/llama3-8b-8192` | Groq | `GROQ_API_KEY` |
+| `deepseek/deepseek-chat` | DeepSeek | `DEEPSEEK_API_KEY` |
+| `ollama/mistral` | Local Ollama | — |
 
 ---
-*Built with ❤️ by the Urban Swarm Research Group.*
+
+## Agent Routing
+
+Each task is classified by the `DepthClassifier` (keyword rules + optional ML model) into one of three depths:
+
+| Depth | Agent | LLM calls | Use case |
+|---|---|---|---|
+| `simple` | `ReactiveAgent` | 0 | Status checks, pings, heartbeats |
+| `medium` | `RoutingAgent` | 1 | Routing decisions, triage |
+| `complex` | `DeliberativeAgent` | N | Multi-step planning, analysis |
+
+You can override the depth classification:
+
+```python
+result = await swarm.dispatch("...", forced_depth="complex")
+```
+
+---
+
+## Registering Tools
+
+Agents can call registered async functions during plan execution:
+
+```python
+async def search_database(query: str) -> str:
+    ...  # your implementation
+
+swarm.register_tool(
+    name="search_database",
+    func=search_database,
+    description="Search the internal knowledge base",
+    risk=RiskLevel.LOW,
+)
+```
+
+The tool name appears in the planner prompt; the LLM sets `"command": "search_database"` on a step node to invoke it.
+
+---
+
+## Human-in-the-Loop
+
+Steps marked `"interrupt": true` in the plan pause execution until approved:
+
+```python
+suspended = swarm.get_suspended_tasks()
+# {"agent_0": "Deploy updated configuration to all production nodes"}
+
+swarm.approve("agent_0")   # resumes execution
+```
+
+---
+
+## REST API
+
+Start the server:
+
+```bash
+uvicorn soma_v2.api.server:app --reload
+```
+
+Or set a custom model:
+
+```bash
+SOMA_MODEL=openai/gpt-4o uvicorn soma_v2.api.server:app --reload
+```
+
+**Endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/mission` | Dispatch a task (async) |
+| `GET` | `/mission/{id}` | Poll task result |
+| `GET` | `/suspended` | List HITL-paused tasks |
+| `POST` | `/approve/{agent_id}` | Resume a suspended task |
+| `GET` | `/metrics` | Swarm statistics |
+| `GET` | `/health` | Liveness probe |
+
+Interactive docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+---
+
+## Architecture
+
+```
+SOMASwarm (main.py)
+  └─ AgentDirector (core/director.py)        — pool manager
+       ├─ AgentSlot × N
+       │    └─ V2Kernel (core/kernel.py)     — per-agent kernel
+       │         ├─ DepthClassifier          — task complexity routing
+       │         ├─ ReactiveAgent            — rule-based (0 LLM calls)
+       │         ├─ RoutingAgent             — single LLM call
+       │         └─ DeliberativeAgent        — DAG planner
+       │              └─ PlanExecutor        — wave-ordered DAG execution
+       ├─ HierarchicalMemory                 — hot (LRU) + cold (ChromaDB)
+       ├─ A2ABus                             — in-process message bus
+       └─ TelemetryStore                     — JSONL trace writer
+```
+
+---
+
+## Project Structure
+
+```
+soma/
+├── src/soma_v2/
+│   ├── main.py              # SOMASwarm — top-level API
+│   ├── connectors.py        # OpenAI SDK LLM connector
+│   ├── agents/
+│   │   ├── reactive.py      # D1 rule-based agent
+│   │   ├── routing.py       # D2 single-LLM agent
+│   │   └── deliberative.py  # D3 DAG planner
+│   ├── core/
+│   │   ├── kernel.py        # Per-agent kernel
+│   │   ├── director.py      # Pool manager
+│   │   ├── planner.py       # PlanGraph + PlanExecutor
+│   │   ├── depth_classifier.py
+│   │   ├── a2a.py           # In-process message bus
+│   │   ├── blackboard.py    # Resource locking
+│   │   ├── broker.py        # Negotiation broker
+│   │   ├── telemetry.py     # JSONL tracer
+│   │   └── tools.py         # Tool registry
+│   ├── memory/
+│   │   ├── hierarchical.py  # Memory facade
+│   │   ├── hot.py           # LRU cache
+│   │   └── cold.py          # ChromaDB episodic store
+│   └── api/
+│       └── server.py        # FastAPI REST server
+├── example_quickstart.py
+├── pyproject.toml
+└── requirements.txt
+```
+
+---
+
+## License
+
+MIT

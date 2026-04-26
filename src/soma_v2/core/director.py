@@ -2,24 +2,19 @@
 SOMA V2 — AgentDirector
 ========================
 Orchestrates a pool of named AgentSlot objects (each wrapping a V2Kernel).
-Assigns incoming tasks via A2A bidding; handles delegation and overload.
+Assigns incoming tasks via a fast local slot-selection algorithm.
 
 Lifecycle of a task
 -------------------
-1.  Director receives task via `assign(event, ...)`.
-2.  Director broadcasts TASK_BID to all slots.
-3.  Each slot replies BID_RESPONSE: accept if load < capacity, with load score.
-4.  Director picks winner (lowest load), sends TASK_CLAIM.
-5.  Winner executes via its V2Kernel.handle().
-6.  If winner is overloaded mid-execution, it sends TASK_DELEGATE.
-7.  Director re-runs bidding excluding the delegating slot (max 2 hops).
-8.  Final TASK_RESULT returned to caller.
+1. Director receives task via assign(event, ...).
+2. Director picks the least-loaded available slot locally (no message round-trip).
+3. Selected slot executes the task via its V2Kernel.handle().
+4. Director returns TASK_RESULT to the caller.
 
 Pool roles
 ----------
-Slots are typed by agent_role (EMERGENCY, SUPERVISOR, PEER, ROUTINE).
-EMERGENCY/SUPERVISOR slots always bid regardless of load — they override.
-PEER/ROUTINE slots reject if current_load >= capacity.
+EMERGENCY / SUPERVISOR slots take priority for high/emergency urgency tasks.
+PEER / ROUTINE slots reject tasks if current_load >= capacity.
 """
 
 from __future__ import annotations
@@ -30,41 +25,31 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
-from .a2a import A2ABus, A2AMessage, MsgType
+from .a2a import A2ABus
 from .blackboard import ResourceBlackboard
 from .broker import NegotiationBroker
 from .kernel import V2Kernel
+from .tools import ToolRegistry
 from ..memory.hierarchical import HierarchicalMemory
 
 logger = logging.getLogger("SOMA_V2.DIRECTOR")
 
-PRIORITY_ROLES = {"EMERGENCY", "SUPERVISOR"}
+PRIORITY_ROLES    = {"EMERGENCY", "SUPERVISOR"}
 MAX_DELEGATE_HOPS = 2
-BID_TIMEOUT   = 1.0   # seconds to wait for all bids
-RESULT_TIMEOUT = 30.0  # seconds to wait for task result
 
 
 # ── agent slot ────────────────────────────────────────────────────────────────
 
 @dataclass
 class AgentSlot:
-    """
-    One agent in the pool. Wraps a V2Kernel instance.
-    Runs an async listener loop that processes bus messages.
-    """
-    slot_id:    str
-    role:       str          # EMERGENCY | SUPERVISOR | PEER | ROUTINE
-    capacity:   int = 4      # max concurrent tasks
-    kernel:     Optional[V2Kernel] = field(default=None, repr=False)
+    """One agent in the pool. Wraps a V2Kernel instance."""
+    slot_id:  str
+    role:     str           # EMERGENCY | SUPERVISOR | PEER | ROUTINE
+    capacity: int = 4       # max concurrent tasks
+    kernel:   Optional[V2Kernel] = field(default=None, repr=False)
+    memory:   Optional[HierarchicalMemory] = field(default=None, repr=False)
 
-    memory:     Optional[HierarchicalMemory] = field(default=None, repr=False)
-    telemetry:  Optional[Any] = field(default=None, repr=False)
-
-    _load:      int               = field(default=0,    init=False, repr=False)
-    _bus:       Optional[A2ABus]  = field(default=None, init=False, repr=False)
-    _queue:     Optional[asyncio.Queue] = field(default=None, init=False, repr=False)
-    _listener:  Optional[asyncio.Task]  = field(default=None, init=False, repr=False)
-    _pending:   Dict[str, asyncio.Future] = field(default_factory=dict, init=False, repr=False)
+    _load: int = field(default=0, init=False, repr=False)
 
     @property
     def load(self) -> int:
@@ -74,191 +59,86 @@ class AgentSlot:
     def available(self) -> bool:
         return self._load < self.capacity
 
-    def attach(self, bus: A2ABus) -> None:
-        self._bus   = bus
-        self._queue = bus.register(self.slot_id)
-
-    async def start(self) -> None:
-        self._listener = asyncio.create_task(self._listen(), name=f"slot-{self.slot_id}")
-
-    async def stop(self) -> None:
-        if self._listener:
-            self._listener.cancel()
-
-    async def _listen(self) -> None:
-        while True:
-            try:
-                msg = await self._queue.get()
-                asyncio.create_task(self._handle_msg(msg))
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error(f"Slot {self.slot_id} listener error: {exc}")
-
-    async def _handle_msg(self, msg: A2AMessage) -> None:
-        if msg.msg_type == MsgType.TASK_BID:
-            await self._on_bid(msg)
-        elif msg.msg_type == MsgType.TASK_CLAIM:
-            await self._on_claim(msg)
-
-    async def _on_bid(self, msg: A2AMessage) -> None:
-        urgency   = msg.payload.get("context", {}).get("urgency", "medium")
-        high_prio = urgency in ("high", "emergency")
-        # Priority roles override capacity only for high/emergency urgency
-        accept = (self._load < self.capacity) or (high_prio and self.role in PRIORITY_ROLES)
-        load_score = self._load / max(self.capacity, 1)
-        response = A2AMessage(
-            msg_type=MsgType.BID_RESPONSE,
-            sender=self.slot_id,
-            recipient=msg.sender,
-            task_id=msg.task_id,
-            payload={
-                "accept":     accept,
-                "load_score": round(load_score, 3),
-                "role":       self.role,
-            },
-        )
-        await self._bus.send(response)
-
-    async def _on_claim(self, msg: A2AMessage) -> None:
-        self._load += 1
-        task_id = msg.task_id
-        event   = msg.payload["event"]
-        ctx     = msg.payload["context"]
-        urgency = ctx.get("urgency", "medium")
-
-        if self.memory:
-            self.memory.task_start(self.slot_id, task_id, event, ctx)
-
-        logger.info(f"Slot {self.slot_id}: executing task {task_id} (load={self._load})")
-        success = False
-        try:
-            result = await self.kernel.handle(
-                event,
-                agent_role=self.role,
-                confidence=ctx.get("confidence", 0.75),
-                urgency=urgency,
-                contested=ctx.get("contested", False),
-                reroute_attempts=ctx.get("reroute_attempts", 0),
-            )
-            success = True
-            outcome = {"status": "success", "result": result}
-        except Exception as exc:
-            logger.warning(f"Slot {self.slot_id}: task {task_id} failed: {exc}")
-            outcome = {"status": "error", "error": str(exc)}
-        finally:
-            self._load = max(0, self._load - 1)
-            if self.memory:
-                agent_type = outcome.get("result", {}).get("agent_type", "unknown") if success else "unknown"
-                decision   = outcome.get("result", {}).get("decision", {}) if success else {}
-                action     = decision.get("action", "unknown")
-                meta       = decision.get("metadata", {})
-                extra      = {"plan_json": meta.get("plan_json")} if meta.get("plan_json") else None
-                self.memory.task_done(self.slot_id, agent_type, action, urgency, success, extra=extra)
-
-        await self._bus.send(A2AMessage(
-            msg_type=MsgType.TASK_RESULT,
-            sender=self.slot_id,
-            recipient=msg.sender,
-            task_id=task_id,
-            payload=outcome,
-        ))
-
 
 # ── director ─────────────────────────────────────────────────────────────────
 
 class AgentDirector:
     """
-    Pool manager + A2A negotiation coordinator.
+    Pool manager.
 
     Usage
     -----
     director = AgentDirector(llm_callback=my_llm)
     director.add_slot("peer_1", role="PEER")
     director.add_slot("supervisor_1", role="SUPERVISOR")
-    await director.start()
-    result = await director.assign("Traffic jam at node 7", urgency="high")
+    result = await director.assign("Summarize the quarterly report", urgency="high")
     await director.stop()
     """
 
     def __init__(
-        self, 
-        llm_callback=None, 
-        memory: Optional[HierarchicalMemory] = None, 
-        actuator: Optional[Any] = None, 
+        self,
+        llm_callback=None,
+        memory: Optional[HierarchicalMemory] = None,
         tool_registry: Optional[ToolRegistry] = None,
         telemetry: Optional[Any] = None,
         bus: Optional[A2ABus] = None,
-        blackboard: Optional[ResourceBlackboard] = None,
-        **kernel_kwargs
+        **kernel_kwargs,
     ) -> None:
         self.llm_callback   = llm_callback
-        self.actuator       = actuator
         self.tool_registry  = tool_registry
         self.telemetry      = telemetry
         self._kernel_kwargs = kernel_kwargs
         self._memory        = memory or HierarchicalMemory()
-        self._bus:        A2ABus             = bus or A2ABus(telemetry=self.telemetry)
-        self._blackboard: ResourceBlackboard = blackboard or ResourceBlackboard(bus=self._bus)
-        self._negotiator: NegotiationBroker  = NegotiationBroker(blackboard=self._blackboard, bus=self._bus)
-        self._slots: Dict[str, AgentSlot] = {}
-        self._director_id = "director"
-        self._dir_queue   = self._bus.register(self._director_id)
-        self._stats: Dict[str, int]   = {"tasks_assigned": 0, "tasks_delegated": 0, "tasks_failed": 0, "overflow_routes": 0}
-        self._rr_counter: int         = 0
-        self._pool_map: Dict[str, Any] = {}   # unit_id -> ResourcePool; shared by reference with all kernels
+        self._bus           = bus or A2ABus(telemetry=self.telemetry)
+        self._blackboard    = ResourceBlackboard(bus=self._bus)
+        self._negotiator    = NegotiationBroker(
+            blackboard=self._blackboard, bus=self._bus
+        )
+        self._slots:      Dict[str, AgentSlot] = {}
+        self._stats: Dict[str, int] = {
+            "tasks_assigned": 0,
+            "tasks_failed":   0,
+            "overflow_routes": 0,
+        }
+        self._rr_counter: int = 0
 
     def add_slot(
         self,
-        slot_id: str,
-        role: str = "PEER",
+        slot_id:  str,
+        role:     str = "PEER",
         capacity: int = 4,
     ) -> "AgentDirector":
-        async def _delegate(sub_task: str, urgency: str = "medium") -> str:
-            """Route a plan sub-task back through Director A2A — one hop max."""
-            result = await self.assign(sub_task, urgency=urgency, _hop=MAX_DELEGATE_HOPS)
-            decision = result.get("result", {}).get("decision", {})
-            return decision.get("rationale", result.get("result", {}).get("depth", "delegated"))
-
+        """Add a new agent slot to the pool."""
         kernel = V2Kernel(
-            llm_callback=self.llm_callback, memory=self._memory,
-            actuator=self.actuator, delegate_fn=_delegate,
-            blackboard=self._blackboard, agent_id=slot_id,
-            negotiation_broker=self._negotiator,
-            resource_pools=self._pool_map,
+            llm_callback=self.llm_callback,
+            memory=self._memory,
             tool_registry=self.tool_registry,
             telemetry=self.telemetry,
+            agent_id=slot_id,
             **self._kernel_kwargs,
         )
-        slot   = AgentSlot(slot_id=slot_id, role=role, capacity=capacity, kernel=kernel, memory=self._memory, telemetry=self.telemetry)
-        slot.attach(self._bus)
+        slot = AgentSlot(
+            slot_id=slot_id,
+            role=role,
+            capacity=capacity,
+            kernel=kernel,
+            memory=self._memory,
+        )
         self._slots[slot_id] = slot
         logger.info(f"AgentDirector: added slot '{slot_id}' role={role}")
         return self
 
-    def register_pool(self, pool: Any) -> "AgentDirector":
-        """Register a ResourcePool so kernels use pool claiming for its units."""
-        for unit in pool._units:
-            self._pool_map[unit] = pool
-        logger.info(f"AgentDirector: registered pool '{pool.pool_id}' ({len(pool._units)} units)")
-        return self
-
-    async def start(self) -> None:
-        for slot in self._slots.values():
-            await slot.start()
-        logger.info(f"AgentDirector: started with {len(self._slots)} slots")
-
     async def stop(self) -> None:
-        for slot in self._slots.values():
-            await slot.stop()
+        """Gracefully stop all slots."""
+        logger.info("AgentDirector: stopped")
 
-    # ── public API ────────────────────────────────────────────────────────────
+    # ── slot selection ────────────────────────────────────────────────────────
 
     def _pick_slot(self, urgency: str, excluded: Set[str]) -> Optional[str]:
         """
-        Fast local slot selection — no message passing.
-        Director reads slot loads directly; avoids A2A roundtrip for normal assigns.
-        Priority roles get preference only for high/emergency urgency.
+        Pick the best available slot locally (no A2A round-trip).
+        Priority slots get preference on high/emergency urgency tasks.
+        Falls back to least-loaded slot if all are at capacity.
         """
         high_prio  = urgency in ("high", "emergency")
         slot_order = {sid: i for i, sid in enumerate(self._slots)}
@@ -268,7 +148,7 @@ class AgentDirector:
             if sid not in excluded and s.available
         ]
         if not candidates:
-            # all slots full — pick least loaded
+            # All full — pick least loaded as overflow
             candidates = [
                 (sid, s) for sid, s in self._slots.items()
                 if sid not in excluded
@@ -284,6 +164,8 @@ class AgentDirector:
 
         return min(candidates, key=_key)[0]
 
+    # ── task assignment ───────────────────────────────────────────────────────
+
     async def assign(
         self,
         event: str,
@@ -296,10 +178,7 @@ class AgentDirector:
         _hop: int = 0,
     ) -> Dict[str, Any]:
         """
-        Assign a task to the best available agent.
-
-        Fast path (default): director picks slot locally from known load state.
-        A2A protocol is used only for delegation (slot signals it can't finish).
+        Assign a task to the best available agent and return the result.
         """
         if _hop > MAX_DELEGATE_HOPS:
             self._stats["tasks_failed"] += 1
@@ -307,8 +186,10 @@ class AgentDirector:
 
         task_id  = uuid.uuid4().hex[:10]
         excluded = _excluded or set()
-        context  = {"urgency": urgency, "confidence": confidence,
-                    "contested": contested, "reroute_attempts": reroute_attempts}
+        context  = {
+            "urgency": urgency, "confidence": confidence,
+            "contested": contested, "reroute_attempts": reroute_attempts,
+        }
 
         winner_id = self._pick_slot(urgency, excluded)
         if winner_id is None:
@@ -317,28 +198,24 @@ class AgentDirector:
 
         self._rr_counter += 1
         slot = self._slots[winner_id]
-        logger.info(f"AgentDirector: task {task_id} -> '{winner_id}' load={slot.load} (hop={_hop})")
 
-        if _hop > 0:
-            self._stats["tasks_delegated"] += 1
-        # track tasks routed to a slot that already has work (cross-slot load sharing)
         if slot._load > 0:
             self._stats["overflow_routes"] += 1
 
         if self.telemetry:
             self.telemetry.log_event("task_assigned", {
-                "task_id": task_id,
-                "winner_id": winner_id,
+                "task_id":     task_id,
+                "winner_id":   winner_id,
                 "winner_role": slot.role,
                 "winner_load": slot.load,
-                "hop": _hop,
-                "event": event[:100]
+                "hop":         _hop,
+                "event":       event[:100],
             })
 
-        # Execute directly on the slot — no queue hops for normal path
         self._stats["tasks_assigned"] += 1
         slot._load += 1
         success = False
+
         try:
             if self._memory:
                 self._memory.task_start(winner_id, task_id, event, context)
@@ -355,18 +232,26 @@ class AgentDirector:
             )
             success = True
             outcome = {"status": "success", "result": result}
+
         except Exception as exc:
-            logger.warning(f"Slot {winner_id}: task {task_id} failed: {exc}")
+            logger.warning(f"Slot '{winner_id}': task {task_id} failed: {exc}")
             outcome = {"status": "error", "error": str(exc)}
+
         finally:
             slot._load = max(0, slot._load - 1)
             if self._memory:
-                agent_type = outcome.get("result", {}).get("agent_type", "unknown") if success else "unknown"
-                decision   = outcome.get("result", {}).get("decision", {}) if success else {}
-                action     = decision.get("action", "unknown") if isinstance(decision, dict) else "unknown"
-                meta       = decision.get("metadata", {}) if isinstance(decision, dict) else {}
-                plan_json  = meta.get("plan_json")
-                extra      = {"plan_json": plan_json} if plan_json else None
+                agent_type = (
+                    outcome.get("result", {}).get("agent_type", "unknown")
+                    if success else "unknown"
+                )
+                decision = (
+                    outcome.get("result", {}).get("decision", {})
+                    if success else {}
+                )
+                action    = decision.get("action", "unknown") if isinstance(decision, dict) else "unknown"
+                meta      = decision.get("metadata", {}) if isinstance(decision, dict) else {}
+                plan_json = meta.get("plan_json")
+                extra     = {"plan_json": plan_json} if plan_json else None
                 self._memory.task_done(winner_id, agent_type, action, urgency, success, extra=extra)
 
         outcome["task_id"]     = task_id
@@ -378,19 +263,19 @@ class AgentDirector:
 
     @property
     def stats(self) -> Dict[str, Any]:
-        slot_loads = {sid: s.load for sid, s in self._slots.items()}
-        return {**self._stats, "slot_loads": slot_loads,
-                "bus_messages": self._bus.message_count,
-                "blackboard":  self._blackboard.stats,
-                "negotiation": self._negotiator.stats,
-                "memory":      self._memory.stats}
+        return {
+            **self._stats,
+            "slot_loads":  {sid: s.load for sid, s in self._slots.items()},
+            "bus_messages": self._bus.message_count,
+            "memory":       self._memory.stats,
+        }
 
     @property
     def pool_size(self) -> int:
         return len(self._slots)
 
     def get_suspended_tasks(self) -> Dict[str, str]:
-        """Returns a map of agent_id -> suspended_node_description."""
+        """Returns {agent_id: suspended_step_description} for all suspended agents."""
         suspended = {}
         for sid, slot in self._slots.items():
             node = slot.kernel.get_suspended_node()
@@ -398,10 +283,11 @@ class AgentDirector:
                 suspended[sid] = node.description
         return suspended
 
-    def approve_task(self, agent_id: str):
-        """Resumes a specific agent's plan."""
+    def approve_task(self, agent_id: str) -> bool:
+        """Resumes a suspended agent's plan. Returns True if found."""
         if agent_id in self._slots:
             self._slots[agent_id].kernel.approve()
-            logger.info(f"AgentDirector: Approved task on agent '{agent_id}'")
-        else:
-            logger.warning(f"AgentDirector: Cannot approve unknown agent '{agent_id}'")
+            logger.info(f"AgentDirector: approved task on '{agent_id}'")
+            return True
+        logger.warning(f"AgentDirector: cannot approve unknown agent '{agent_id}'")
+        return False

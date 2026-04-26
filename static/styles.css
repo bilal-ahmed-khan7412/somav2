@@ -1,0 +1,378 @@
+:root {
+    --bg-main: #0B0E14;
+    --bg-panel: #141822;
+    --bg-card: #1D2331;
+    --border-color: rgba(255, 255, 255, 0.08);
+    --text-main: #E2E8F0;
+    --text-muted: #94A3B8;
+    
+    --color-success: #10B981;
+    --color-warning: #F59E0B;
+    --color-danger: #EF4444;
+    --color-primary: #3B82F6;
+    
+    --agent-command: #D946EF;
+    --agent-field: #06B6D4;
+    --agent-support: #EAB308;
+    
+    --font-ui: 'Inter', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background-color: var(--bg-main);
+    color: var(--text-main);
+    font-family: var(--font-ui);
+    min-height: 100vh;
+    overflow-y: auto; /* Allow scrolling if screen is small */
+}
+
+.dashboard-container {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    padding: 1rem;
+    gap: 1rem;
+}
+
+/* Header */
+.top-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-panel);
+    padding: 1rem 2rem;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.logo h1 {
+    font-size: 1.25rem;
+    font-weight: 800;
+    letter-spacing: 1px;
+}
+
+.logo h1 span {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.pulse-dot {
+    width: 12px;
+    height: 12px;
+    background-color: var(--color-success);
+    border-radius: 50%;
+    box-shadow: 0 0 12px var(--color-success);
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% { transform: scale(0.95); opacity: 0.8; }
+    50% { transform: scale(1.1); opacity: 1; }
+    100% { transform: scale(0.95); opacity: 0.8; }
+}
+
+.btn {
+    background: rgba(59, 130, 246, 0.1);
+    color: var(--color-primary);
+    border: 1px solid var(--color-primary);
+    padding: 0.5rem 1.5rem;
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    letter-spacing: 0.5px;
+}
+
+.btn:hover {
+    background: var(--color-primary);
+    color: #fff;
+    box-shadow: 0 0 15px rgba(59, 130, 246, 0.5);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Main Grid */
+.main-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1rem;
+    flex: 1;
+    min-height: 0;
+}
+
+.panel {
+    background: var(--bg-panel);
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    min-height: 500px; /* Ensure panels don't collapse too small */
+}
+
+.panel h2 {
+    font-size: 0.875rem;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-muted);
+    margin-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 0.75rem;
+}
+
+/* Server Map */
+.server-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    align-items: center;
+}
+
+.server-row {
+    display: flex;
+    gap: 2rem;
+}
+
+.server-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 1.5rem;
+    width: 160px;
+    text-align: center;
+    position: relative;
+    transition: all 0.3s ease;
+}
+
+.server-card.state-healthy {
+    border-color: rgba(16, 185, 129, 0.3);
+}
+
+.server-card.state-warning {
+    border-color: var(--color-warning);
+    box-shadow: 0 0 15px rgba(245, 158, 11, 0.2);
+    animation: flash-warning 2s infinite;
+}
+
+.server-card.state-danger {
+    border-color: var(--color-danger);
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.3);
+    animation: shake 0.5s ease-in-out;
+}
+
+@keyframes flash-warning {
+    0%, 100% { background: var(--bg-card); }
+    50% { background: rgba(245, 158, 11, 0.05); }
+}
+
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-5px); }
+    75% { transform: translateX(5px); }
+}
+
+.server-icon {
+    font-size: 2.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.server-name {
+    font-weight: 600;
+    font-size: 0.875rem;
+    margin-bottom: 0.25rem;
+}
+
+.server-status {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.server-card.state-healthy .server-status { color: var(--color-success); }
+.server-card.state-warning .server-status { color: var(--color-warning); }
+.server-card.state-danger .server-status { color: var(--color-danger); }
+
+.lock-indicator {
+    position: absolute;
+    top: -10px;
+    right: -10px;
+    background: #fff;
+    color: #000;
+    font-size: 0.75rem;
+    font-weight: bold;
+    padding: 4px 8px;
+    border-radius: 12px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+}
+
+.lock-indicator.visible {
+    opacity: 1;
+}
+
+/* Agents */
+.agent-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.agent-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1rem;
+    border-left: 4px solid var(--text-muted);
+}
+
+.agent-card.agent_0 { border-left-color: var(--agent-command); }
+.agent-card.agent_1 { border-left-color: var(--agent-field); }
+.agent-card.agent_2 { border-left-color: var(--agent-support); }
+
+.agent-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 0.5rem;
+}
+
+.role {
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.role.COMMAND { color: var(--agent-command); }
+.role.FIELD { color: var(--agent-field); }
+.role.SUPPORT { color: var(--agent-support); }
+
+.load-badge {
+    background: rgba(255,255,255,0.1);
+    font-size: 0.65rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.agent-card.busy .load-badge {
+    background: var(--color-danger);
+    color: white;
+}
+
+.agent-task {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Negotiation Feed */
+.negotiation-feed {
+    flex: 1;
+    overflow-y: auto;
+    background: rgba(0,0,0,0.3);
+    border-radius: 6px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.neg-message {
+    font-size: 0.8rem;
+    background: rgba(255,255,255,0.05);
+    padding: 0.75rem;
+    border-radius: 6px;
+    border-left: 2px solid;
+    animation: fade-in 0.3s ease-out;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.neg-msg-PROPOSAL { border-left-color: var(--color-warning); }
+.neg-msg-ACCEPT { border-left-color: var(--color-success); }
+.neg-msg-REJECT { border-left-color: var(--color-danger); }
+
+.neg-participants {
+    display: flex;
+    gap: 5px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    margin-bottom: 4px;
+    color: var(--text-muted);
+}
+
+.neg-text {
+    font-family: var(--font-mono);
+    color: #fff;
+}
+
+/* Terminal Log */
+.terminal-panel {
+    background: #000;
+    border-color: #333;
+}
+
+.terminal-content {
+    flex: 1;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 0.85rem; /* Slightly larger for readability */
+    line-height: 1.6;
+    padding-right: 0.5rem;
+}
+
+.log-line {
+    margin-bottom: 4px;
+    word-break: break-all;
+}
+
+.log-time {
+    color: #4B5563;
+    margin-right: 8px;
+}
+
+.log-level-INFO { color: var(--color-primary); }
+.log-level-WARNING { color: var(--color-warning); }
+.log-level-ERROR { color: var(--color-danger); font-weight: bold; }
+.log-level-DEBUG { color: #6B7280; }
+
+.log-llm {
+    color: #D946EF;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+    width: 6px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.1);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.2);
+}
